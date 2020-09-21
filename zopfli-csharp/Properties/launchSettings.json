@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "zopfli-csharp": {
+      "commandName": "Project",
+      "commandLineArgs": "D:\\treeinfo.wc"
+    }
+  }
+}
