@@ -48,40 +48,25 @@ namespace ZopfliCSharp
 
         static void CompressFile()
         {
-            int testsize;
-            long InSize;
-            byte[] InFile;
-
-            using (FileStream fs = File.Open(Globals.filename, FileMode.Open))
+            /* Stream both input and output so the whole file and the whole compressed
+               result are never held in memory at once. */
+            using (FileStream inStream = new FileStream(Globals.filename, FileMode.Open,
+                       FileAccess.Read, FileShare.Read, 1 << 16))
             {
-                InSize = fs.Length;
-                if (InSize > 2147483647)
+                if (inStream.Length > 2147483647)
                 {
                     Console.WriteLine("Files larger than 2GB are not supported.");
                     Environment.Exit(1);
                 }
 
-                InFile = new byte[InSize];
-                testsize = fs.Read(InFile, 0, (int)InSize);
-
-                if(testsize != (int) InSize)
+                Stream outStream = (Globals.outfilename != "")
+                    ? new FileStream(Globals.outfilename, FileMode.Create, FileAccess.Write)
+                    : Console.OpenStandardOutput();
+                using (BufferedStream bs = new BufferedStream(outStream, 1 << 16))
                 {
-                    Console.WriteLine("Invalid filename: " + Globals.filename);
-                    Environment.Exit(1);
+                    Compress.ZopfliCompress(inStream, bs);
                 }
             }
-
-            byte[] OutFile;
-            OutFile = Compress.ZopfliCompress(InFile);
-
-            if(Globals.outfilename != "")
-            {
-                File.WriteAllBytes(Globals.outfilename, OutFile);
-            } else
-            {
-                Console.Write(OutFile);
-            }
-
         }
 
         static int Main(string[] args)

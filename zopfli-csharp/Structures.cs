@@ -1,7 +1,73 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
 using ZopfliCSharp;
+
+/*
+Streaming output sink that mirrors the subset of List<byte> operations the
+deflate encoder uses (Add, AddRange, Count, and indexing the last byte while it
+is being bit-packed), but flushes completed bytes to an underlying Stream after
+each master block instead of holding the whole compressed result in memory.
+
+The bit writers only ever mutate the most recently added byte (index Count-1);
+once a byte is complete and a new one is appended, the old one is never touched
+again. That invariant is what makes it safe to flush everything except the last
+(possibly still-being-packed) byte.
+*/
+sealed class OutputSink
+{
+    readonly Stream _out;
+    readonly List<byte> _buf;   /* Bytes not yet written to _out. */
+    long _flushed;              /* Count of bytes already written to _out. */
+
+    public OutputSink(Stream outStream)
+    {
+        _out = outStream;
+        _buf = new List<byte>();
+        _flushed = 0;
+    }
+
+    /* Total bytes logically written so far (flushed + buffered). Callers use this
+       as a running offset to measure the emitted size of a block. */
+    public int Count => (int)(_flushed + _buf.Count);
+
+    public void Add(byte b) => _buf.Add(b);
+
+    public void AddRange(IEnumerable<byte> items) => _buf.AddRange(items);
+
+    /* Only ever indexed at Count-1, the byte currently being bit-packed, which is
+       always still in the buffer because FlushCompleted keeps the last byte. */
+    public byte this[int index]
+    {
+        get => _buf[index - (int)_flushed];
+        set => _buf[index - (int)_flushed] = value;
+    }
+
+    /* Write out every completed byte, keeping only the final byte (which may still
+       receive more bits in the next block) in memory. */
+    public void FlushCompleted()
+    {
+        int n = _buf.Count - 1;   /* Keep the last byte. */
+        if (n <= 0) return;
+        _out.Write(CollectionsMarshal.AsSpan(_buf).Slice(0, n));
+        _buf.RemoveRange(0, n);
+        _flushed += n;
+    }
+
+    /* Write everything remaining and flush the underlying stream. */
+    public void Finish()
+    {
+        if (_buf.Count > 0)
+        {
+            _out.Write(CollectionsMarshal.AsSpan(_buf));
+            _flushed += _buf.Count;
+            _buf.Clear();
+        }
+        _out.Flush();
+    }
+}
 
 class ZopfliLZ77Store
 {

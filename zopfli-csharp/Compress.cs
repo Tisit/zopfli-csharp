@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Numerics;
 using System.Runtime.CompilerServices;
@@ -45,21 +46,25 @@ namespace ZopfliCSharp
         */
         const double ZOPFLI_LARGE_FLOAT = 1e30;
 
-        public static byte[] ZopfliCompress(byte[] InFile)
+        public static void ZopfliCompress(Stream input, Stream output)
         {
+            OutputSink OutFile = new OutputSink(output);
+            long inLength = input.Length;
 
             if (Globals.output_type == ZopfliFormat.ZOPFLI_FORMAT_GZIP)
             {
-                return ZopfliGzipCompress(InFile);
+                ZopfliGzipCompress(input, inLength, OutFile);
             }
             else if (Globals.output_type == ZopfliFormat.ZOPFLI_FORMAT_ZLIB)
             {
-                return ZopfliZlibCompress(InFile);
+                ZopfliZlibCompress(input, inLength, OutFile);
             }
             else //(Globals.output_type == ZopfliFormat.ZOPFLI_FORMAT_DEFLATE)
             {
-                return ZopfliDeflate(InFile, 2 /* Dynamic block */, 1).ToArray();
+                ZopfliDeflate(input, inLength, 2 /* Dynamic block */, 1, OutFile, new NullChecksum());
             }
+
+            OutFile.Finish();
         }
         /* CRC polynomial: 0xedb88320 */
         static readonly ulong [] crc32_table = {
@@ -119,12 +124,61 @@ namespace ZopfliCSharp
             return result ^ 0xffffffff;
         }
 
-        /* Compresses the data according to the gzip specification, RFC 1952. */
-        static byte[] ZopfliGzipCompress(byte[] InFile)
+        /* Incremental checksums so the input can be streamed one chunk at a time
+           rather than scanned in full up front. */
+        abstract class Checksum
         {
-            ulong crcvalue = CRC(InFile, InFile.Length);
-            List<byte> OutFile = new List<byte>();
+            public abstract void Update(byte[] data, int offset, int count);
+        }
 
+        sealed class NullChecksum : Checksum
+        {
+            public override void Update(byte[] data, int offset, int count) { }
+        }
+
+        sealed class Crc32Checksum : Checksum
+        {
+            ulong result = 0xffffffff;
+            public override void Update(byte[] data, int offset, int count)
+            {
+                for (int i = offset; count > 0; count--, i++)
+                {
+                    result = crc32_table[(result ^ data[i]) & 0xff] ^ (result >> 8);
+                }
+            }
+            public uint Value => (uint)(result ^ 0xffffffff);
+        }
+
+        sealed class Adler32Checksum : Checksum
+        {
+            const uint mod = 65521;
+            uint a = 1, b = 0;
+            public override void Update(byte[] data, int offset, int count)
+            {
+                for (int i = offset; i < offset + count; i++)
+                {
+                    a = (a + data[i]) % mod;
+                    b = (b + a) % mod;
+                }
+            }
+            public uint Value => (b << 16) | a;
+        }
+
+        /* Reads exactly count bytes from the stream into buf at offset. */
+        static void ReadFully(Stream input, byte[] buf, int offset, int count)
+        {
+            int got = 0;
+            while (got < count)
+            {
+                int n = input.Read(buf, offset + got, count - got);
+                if (n <= 0) throw new EndOfStreamException("Unexpected end of input stream.");
+                got += n;
+            }
+        }
+
+        /* Compresses the data according to the gzip specification, RFC 1952. */
+        static void ZopfliGzipCompress(Stream input, long inLength, OutputSink OutFile)
+        {
             OutFile.Add(31);  /* ID1 */
             OutFile.Add(139);  /* ID2 */
             OutFile.Add(8);  /* CM */
@@ -138,7 +192,9 @@ namespace ZopfliCSharp
             OutFile.Add(2);  /* XFL, 2 indicates best compression. */
             OutFile.Add(3);  /* OS follows Unix conventions. */
 
-            OutFile.AddRange(ZopfliDeflate(InFile, 2 /* Dynamic block */, 1));
+            Crc32Checksum crc = new Crc32Checksum();
+            ZopfliDeflate(input, inLength, 2 /* Dynamic block */, 1, OutFile, crc);
+            uint crcvalue = crc.Value;
 
             /* CRC */
             OutFile.Add((byte)(crcvalue % 256));
@@ -146,50 +202,35 @@ namespace ZopfliCSharp
             OutFile.Add((byte)((crcvalue >> 16) % 256));
             OutFile.Add((byte)((crcvalue >> 24) % 256));
 
-            /* ISIZE */
-            OutFile.Add((byte)(InFile.Length % 256));
-            OutFile.Add((byte)((InFile.Length >> 8) % 256));
-            OutFile.Add((byte)((InFile.Length >> 16) % 256));
-            OutFile.Add((byte)((InFile.Length >> 24) % 256));
+            /* ISIZE (low 32 bits of the uncompressed length, per spec) */
+            OutFile.Add((byte)(inLength % 256));
+            OutFile.Add((byte)((inLength >> 8) % 256));
+            OutFile.Add((byte)((inLength >> 16) % 256));
+            OutFile.Add((byte)((inLength >> 24) % 256));
 
             if (Globals.verbose == 1)
             {
-               Console.WriteLine("Original Size: "+ InFile.Length + ", Gzip: " + OutFile.Count + 
-                   " , Compression: " + 100.0 * (double)(InFile.Length - OutFile.Count) / (double)InFile.Length + " Removed");
+               Console.WriteLine("Original Size: "+ inLength + ", Gzip: " + OutFile.Count +
+                   " , Compression: " + 100.0 * (double)(inLength - OutFile.Count) / (double)inLength + " Removed");
             }
-            return OutFile.ToArray();
         }
 
-        /* Calculates the adler32 checksum of the data */
-        static uint adler32(byte[] InFile)
+        static void ZopfliZlibCompress(Stream input, long inLength, OutputSink OutFile)
         {
-            const int mod = 65521;
-            uint a = 1, b = 0;
-            foreach (byte c in InFile)
-            {
-                a = (a + c) % mod;
-                b = (b + a) % mod;
-            }
-            return (b << 16) | a;
-        }
-
-        static byte[] ZopfliZlibCompress(byte[] InFile)
-        {
-            uint checksum = adler32(InFile);
             uint cmf = 120;  /* CM 8, CINFO 7. See zlib spec.*/
             uint flevel = 3;
             uint fdict = 0;
             uint cmfflg = 256 * cmf + fdict * 32 + flevel * 64;
             uint fcheck = 31 - cmfflg % 31;
-            List<byte> OutFile = new List<byte>();
-
 
             cmfflg += fcheck;
 
             OutFile.Add((byte)(cmfflg / 256));
             OutFile.Add((byte)(cmfflg % 256));
 
-            OutFile.AddRange(ZopfliDeflate(InFile, 2 /* dynamic block */, 1 /* final */));
+            Adler32Checksum adler = new Adler32Checksum();
+            ZopfliDeflate(input, inLength, 2 /* dynamic block */, 1 /* final */, OutFile, adler);
+            uint checksum = adler.Value;
 
             OutFile.Add((byte)((checksum >> 24) % 256));
             OutFile.Add((byte)((checksum >> 16) % 256));
@@ -199,30 +240,59 @@ namespace ZopfliCSharp
             if (Globals.verbose > 0)
             {
                 Console.WriteLine(
-                        "Original Size: " + InFile.Length + ", Zlib: " + OutFile.Count + ", Compression: "
-                        + 100.0 * (double)(InFile.Length - OutFile.Count) / (double)InFile.Length + "% Removed");
+                        "Original Size: " + inLength + ", Zlib: " + OutFile.Count + ", Compression: "
+                        + 100.0 * (double)(inLength - OutFile.Count) / (double)inLength + "% Removed");
             }
-            return OutFile.ToArray();
         }
 
-        static List<byte> ZopfliDeflate(byte[] InFile, int btype, int final)
+        /*
+        Streams the input a master block at a time. Only a sliding buffer holding the
+        current master block plus ZOPFLI_WINDOW_SIZE bytes of preceding history is kept
+        in memory; the whole file is never resident. Each ZopfliDeflatePart call runs in
+        buffer-relative coordinates, which is equivalent to absolute coordinates because
+        all positions are only used relatively and to index the 32768-slot rolling hash.
+        */
+        static void ZopfliDeflate(Stream input, long inLength, int btype, int final,
+                                  OutputSink OutFile, Checksum checksum)
         {
-            int i = 0;
-            List<byte> OutFile = new List<byte>();
+            const int WINDOW = ZopfliHash.ZOPFLI_WINDOW_SIZE;
+            byte[] buffer = new byte[WINDOW + ZOPFLI_MASTER_BLOCK_SIZE];
 
             byte[] bp = new byte[1];
             bp[0] = 0;
 
+            long mbStart = 0;
+            int prevBufLen = 0;
+
             do
             {
-                bool masterfinal = (i + ZOPFLI_MASTER_BLOCK_SIZE >= InFile.Length);
+                long mbEnd = mbStart + ZOPFLI_MASTER_BLOCK_SIZE;
+                bool masterfinal = mbEnd >= inLength;
+                if (masterfinal) mbEnd = inLength;
                 bool final2 = (final > 0) && masterfinal;
-                int size = masterfinal ? InFile.Length - i : ZOPFLI_MASTER_BLOCK_SIZE;
-                ZopfliDeflatePart(btype, final2, InFile, i, i + size, bp, OutFile);
-                i += size;
-            } while (i < InFile.Length);
 
-            return OutFile;
+                long bufStart = mbStart > WINDOW ? mbStart - WINDOW : 0;
+                int history = (int)(mbStart - bufStart);  /* Retained window history. */
+                if (history > 0)
+                {
+                    /* Carry the last `history` bytes of the previous buffer to the front. */
+                    Array.Copy(buffer, prevBufLen - history, buffer, 0, history);
+                }
+                int toRead = (int)(mbEnd - mbStart);
+                ReadFully(input, buffer, history, toRead);
+                int bufLen = history + toRead;
+                prevBufLen = bufLen;
+
+                /* Buffer-relative coordinates: the master block starts right after the
+                   retained history and ends at the end of the buffered data. */
+                ZopfliDeflatePart(btype, final2, buffer, history, bufLen, bp, OutFile);
+                checksum.Update(buffer, history, toRead);
+
+                mbStart = mbEnd;
+                /* Flush completed bytes so we never hold more than one master block's
+                   worth of output in memory. */
+                OutFile.FlushCompleted();
+            } while (mbStart < inLength);
         }
 
         /*
@@ -1301,7 +1371,7 @@ namespace ZopfliCSharp
         whole byte. It is: (bp == 0) ? (bytesize * 8) : ((bytesize - 1) * 8 + bp)
         */
         static void AddBit(int bit,
-                            byte[] bp, List<byte> OutFile)
+                            byte[] bp, OutputSink OutFile)
         {
             if (bp[0] == 0) OutFile.Add(0);
             OutFile[OutFile.Count - 1] |= (byte)(bit << bp[0]);
@@ -1310,7 +1380,7 @@ namespace ZopfliCSharp
 
 
         static void AddBits(uint symbol, uint length,
-                    byte[] bp, List<byte> OutFile)
+                    byte[] bp, OutputSink OutFile)
         {
             /* TODO(lode): make more efficient (add more bits at once). */
             ushort i;
@@ -1328,7 +1398,7 @@ namespace ZopfliCSharp
         uses both orders in one standard.
         */
         static void AddHuffmanBits(uint symbol, uint length,
-                                   byte[] bp, List<byte> OutFile)
+                                   byte[] bp, OutputSink OutFile)
         {
             /* TODO(lode): make more efficient (add more bits at once). */
             uint i;
@@ -1395,7 +1465,7 @@ namespace ZopfliCSharp
                          uint[] d_lengths,
                          bool use_16, bool use_17, bool use_18,
                          byte[] bp,
-                         List<byte> OutFile, bool size_only)
+                         OutputSink OutFile, bool size_only)
         {
             uint lld_total;  /* Total amount of literal, length, distance codes. */
             /* Runlength encoded version of lengths of litlen and dist trees. */
@@ -1552,7 +1622,7 @@ namespace ZopfliCSharp
         static void AddDynamicTree(uint[] ll_lengths,
                            uint[] d_lengths,
                            byte[] bp,
-                           List<byte> OutFile)
+                           OutputSink OutFile)
         {
             int i;
             int best = 0;
@@ -1584,8 +1654,9 @@ namespace ZopfliCSharp
             ulong result = 0;
             int i;
             //these are only used to have all parameters for EncodeTree
+            //(size_only is always true here, so nothing is ever written to it)
             byte[] DummyBP = new byte[1];
-            List<byte> DummyOutFIle = new List<byte>();
+            OutputSink DummyOutFIle = new OutputSink(Stream.Null);
 
             for (i = 0; i < 8; i++)
             {
@@ -1609,7 +1680,7 @@ namespace ZopfliCSharp
                         uint[] ll_symbols, uint[] ll_lengths,
                         uint[] d_symbols, uint[] d_lengths,
                         byte[] bp,
-                        List<byte> OutFile)
+                        OutputSink OutFile)
         {
             ulong testlength = 0;
             ulong i;
@@ -1652,7 +1723,7 @@ namespace ZopfliCSharp
                                           byte[] InFile, ulong instart,
                                           ulong inend,
                                           byte[] bp,
-                                          List<byte> OutFile)
+                                          OutputSink OutFile)
         {
             ulong pos = instart;
             for (; ; )
@@ -1712,7 +1783,7 @@ namespace ZopfliCSharp
                          ulong lstart, ulong lend,
                          ulong expected_data_size,
                          byte[] bp,
-                         List<byte> OutFile)
+                         OutputSink OutFile)
         {
             uint[] ll_lengths = new uint[ZOPFLI_NUM_LL];
             uint[] d_lengths = new uint[ZOPFLI_NUM_D];
@@ -1784,7 +1855,7 @@ namespace ZopfliCSharp
                                  ulong lstart, ulong lend,
                                  ulong expected_data_size,
                                  byte[] bp,
-                                 List<byte> OutFilePart)
+                                 OutputSink OutFilePart)
         {
 
             double uncompressedcost = ZopfliCalculateBlockSize(lz77, lstart, lend, 0);
@@ -1949,7 +2020,7 @@ namespace ZopfliCSharp
                                   byte[] InFile, int instart,
                                   int inend,
                                   byte[] bp,
-                                  List<byte> OutFilePart)
+                                  OutputSink OutFilePart)
         {
             int pos = instart;
             for (; ; )
@@ -1996,7 +2067,7 @@ namespace ZopfliCSharp
         This function will usually output multiple deflate blocks. If final is 1, then
         the final bit will be set on the last block.
         */
-        static void ZopfliDeflatePart(int btype, bool final, byte[] InFile, int instart, int inend , byte[] bp, List<byte> OutFilePart)
+        static void ZopfliDeflatePart(int btype, bool final, byte[] InFile, int instart, int inend , byte[] bp, OutputSink OutFilePart)
         {
             int i;
             /* byte coordinates rather than lz77 index */
