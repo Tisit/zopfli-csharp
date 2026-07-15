@@ -37,21 +37,25 @@ namespace zopfli_csharp
         pool: the node memory pool.
         index: The index of the list in which a new chain or leaf is required.
         */
-        static void BoundaryPM(Node[ , ]lists, Node[] leaves, int numsymbols,
+        /* `lists` is a flattened [maxbits, 2] array: element [i, j] lives at [i * 2 + j].
+           A flat Node[] is used instead of Node[,] because multidimensional-array element
+           access goes through an out-of-line CLR helper (IL_STUB_Array_Set/_Get), while
+           1-D access is inlined. */
+        static void BoundaryPM(Node[] lists, Node[] leaves, int numsymbols,
                                Span<Node> pool, ref int PoolNext, int index)
         {
             Node newchain;
             Node oldchain;
-            int lastcount = lists[index, 1].count;  /* Count of last chain of list. */
+            int lastcount = lists[index * 2 + 1].count;  /* Count of last chain of list. */
 
 
             newchain = pool[PoolNext++];
-            oldchain = lists[index, 1];
+            oldchain = lists[index * 2 + 1];
 
             /* These are set up before the recursive calls below, so that there is a list
             pointing to the new node, to let the garbage collection know it's in use. */
-            lists[index, 0] = oldchain;
-            lists[index, 1] = newchain;
+            lists[index * 2] = oldchain;
+            lists[index * 2 + 1] = newchain;
 
             if (index == 0)
             {
@@ -61,7 +65,7 @@ namespace zopfli_csharp
             }
             else
             {
-                uint sum = lists[index - 1, 0].weight + lists[index - 1, 1].weight;
+                uint sum = lists[(index - 1) * 2].weight + lists[(index - 1) * 2 + 1].weight;
                 if (lastcount < numsymbols && sum > leaves[lastcount].weight)
                 {
                     /* New leaf inserted in list, so count is incremented. */
@@ -70,7 +74,7 @@ namespace zopfli_csharp
                 }
                 else
                 {
-                    InitNode(sum, lastcount, lists[index - 1, 1], newchain);
+                    InitNode(sum, lastcount, lists[(index - 1) * 2 + 1], newchain);
                     /* Two lookahead chains of previous list used up, create new ones. */
                     BoundaryPM(lists, leaves, numsymbols, pool, ref PoolNext, index - 1);
                     BoundaryPM(lists, leaves, numsymbols, pool, ref PoolNext, index - 1);
@@ -79,25 +83,25 @@ namespace zopfli_csharp
 
         }
 
-        static void BoundaryPMFinal(Node[,] lists, Node[] leaves, int numsymbols,
+        static void BoundaryPMFinal(Node[] lists, Node[] leaves, int numsymbols,
                                Span<Node> pool, ref int PoolNext, int index)
         {
-            int lastcount = lists[index, 1].count;  /* Count of last chain of list. */
+            int lastcount = lists[index * 2 + 1].count;  /* Count of last chain of list. */
 
-            ulong sum = lists[index - 1, 0].weight + lists[index - 1, 1].weight;
+            ulong sum = lists[(index - 1) * 2].weight + lists[(index - 1) * 2 + 1].weight;
 
             if (lastcount < numsymbols && sum > leaves[lastcount].weight)
             {
                 Node newchain = pool[PoolNext];
-                Node oldchain = lists[index, 1].tail;
+                Node oldchain = lists[index * 2 + 1].tail;
 
-                lists[index, 1] = newchain;
+                lists[index * 2 + 1] = newchain;
                 newchain.count = lastcount + 1;
                 newchain.tail = oldchain;
             }
             else
             {
-                lists[index, 1].tail = lists[index - 1, 1];
+                lists[index * 2 + 1].tail = lists[(index - 1) * 2 + 1];
             }
         }
 
@@ -106,7 +110,7 @@ namespace zopfli_csharp
         weights.
         */
         static void InitLists(
-            Span<Node> pool, ref int PoolNext, Node[] leaves, int maxbits, Node[,] lists)
+            Span<Node> pool, ref int PoolNext, Node[] leaves, int maxbits, Node[] lists)
         {
             int i;
             Node node0 = pool[PoolNext++];
@@ -115,8 +119,8 @@ namespace zopfli_csharp
             InitNode(leaves[1].weight, 2, null, node1);
             for (i = 0; i < maxbits; i++)
             {
-                lists[i, 0] = node0;
-                lists[i, 1] = node1;
+                lists[i * 2] = node0;
+                lists[i * 2 + 1] = node1;
             }
         }
 
@@ -214,8 +218,10 @@ namespace zopfli_csharp
             Span<Node> nodes;
 
             /* Array of lists of chains. Each list requires only two lookahead chains at
-            a time, so each list is a array of two Node*'s. */
-            Node[,] lists;
+            a time, so each list is a array of two Node*'s. Flattened to a 1-D Node[] of
+            length maxbits*2 (element [i, j] at [i * 2 + j]) to avoid multidimensional
+            array access helpers. */
+            Node[] lists;
 
             /* Initialize all bitlengths at 0. */
             bitlengths.Initialize();
@@ -293,7 +299,7 @@ namespace zopfli_csharp
             /* Initialize node memory pool. */
             nodes = InitializeNodes(maxbits * 2 * numsymbols);
 
-            lists = new Node[maxbits, 2];
+            lists = new Node[maxbits * 2];
             InitLists(nodes, ref PoolNext, leaves, maxbits, lists);
 
             /* In the last list, 2 * numsymbols - 2 active chains need to be created. Two
@@ -305,7 +311,7 @@ namespace zopfli_csharp
             }
             BoundaryPMFinal(lists, leaves, numsymbols, nodes, ref PoolNext, maxbits - 1);
 
-            ExtractBitLengths(lists[maxbits - 1, 1], leaves, bitlengths);
+            ExtractBitLengths(lists[(maxbits - 1) * 2 + 1], leaves, bitlengths);
 
             return 0;  /* OK. */
 

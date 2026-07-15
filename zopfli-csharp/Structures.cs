@@ -261,8 +261,12 @@ class ZopfliBlockState
     */
     public uint ZopfliMaxCachedSublen(ulong pos)
     {
-        if (lmc.sublen[ZOPFLI_CACHE_LENGTH * pos * 3 + 1] == 0 && lmc.sublen[ZOPFLI_CACHE_LENGTH * pos * 3 + 2] == 0) return 0;  /* No sublen cached. */
-        return (uint)(lmc.sublen[ZOPFLI_CACHE_LENGTH * pos * 3 + (ZOPFLI_CACHE_LENGTH - 1) * 3] + 3);
+        /* Hoist the per-position base index (int) and the array reference; this runs on
+           the hot cache path and a ulong index / repeated field deref costs here. */
+        byte[] cs = lmc.sublen;
+        int cachebase = (int)(ZOPFLI_CACHE_LENGTH * pos * 3);
+        if (cs[cachebase + 1] == 0 && cs[cachebase + 2] == 0) return 0;  /* No sublen cached. */
+        return (uint)(cs[cachebase + (ZOPFLI_CACHE_LENGTH - 1) * 3] + 3);
     }
 }
 
@@ -320,7 +324,7 @@ speed.
         }
 
         Array.Fill<short>(hashval, -1 /* -1 indicates no head so far. */);
-        same.Initialize();
+        Array.Clear(same, 0, same.Length);
 
         val = 0;
         val2 = 0;

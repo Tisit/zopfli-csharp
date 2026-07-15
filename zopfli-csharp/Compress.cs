@@ -199,7 +199,7 @@ namespace ZopfliCSharp
 
             if (Globals.verbose == 1)
             {
-               Console.WriteLine($"Original Size: {inLength}, Gzip: {OutFile.Count} , Compression: " +
+               Console.Error.WriteLine($"Original Size: {inLength}, Gzip: {OutFile.Count} , Compression: " +
                    $"{100.0 * (inLength - OutFile.Count) / inLength} Removed");
             }
         }
@@ -228,7 +228,7 @@ namespace ZopfliCSharp
 
             if (Globals.verbose > 0)
             {
-                Console.WriteLine($"Original Size: {inLength}, Zlib: {OutFile.Count}, Compression: " +
+                Console.Error.WriteLine($"Original Size: {inLength}, Zlib: {OutFile.Count}, Compression: " +
                         $"{100.0 * (inLength - OutFile.Count) / inLength}% Removed");
             }
         }
@@ -335,43 +335,49 @@ namespace ZopfliCSharp
             ulong pos, ref int limit,
             ushort[] sublen, ref ushort distance, ref ushort length)
         {
-            ulong lmcpos = pos - (ulong)s.blockstart;
+            /* Hoist the cache arrays and read each element once; use an int index so the
+               array accesses get bounds-check elimination (ulong indices defeat it). */
+            ushort[] lmcLength = s.lmc.length;
+            if (lmcLength == null) return 0;  /* No cache (add_lmc == 0). */
+
+            int lmcpos = (int)(pos - (ulong)s.blockstart);
+            ushort cachedLen = lmcLength[lmcpos];
 
             /* Length > 0 and dist 0 is invalid combination, which indicates on purpose
                that this cache value is not filled in yet. */
-            bool cache_available = s.lmc.length != null  && (s.lmc.length[lmcpos] == 0 ||
-                s.lmc.dist[lmcpos] != 0);
-            bool limit_ok_for_cache = cache_available && 
-                (limit == ZOPFLI_MAX_MATCH || s.lmc.length[lmcpos] <= limit ||
-                (sublen != null && s.ZopfliMaxCachedSublen(lmcpos) >= limit));
+            bool cache_available = cachedLen == 0 || s.lmc.dist[lmcpos] != 0;
+            if (!cache_available) return 0;
 
-            if (limit_ok_for_cache && s.lmc != null)
+            /* Pure, so computing it once (when needed) matches the original call count. */
+            uint maxCached = sublen != null ? s.ZopfliMaxCachedSublen((ulong)lmcpos) : 0;
+
+            bool limit_ok_for_cache =
+                limit == ZOPFLI_MAX_MATCH || cachedLen <= limit ||
+                (sublen != null && maxCached >= limit);
+            if (!limit_ok_for_cache) return 0;
+
+            if (sublen == null || cachedLen <= maxCached)
             {
-                if (sublen == null || s.lmc.length[lmcpos]
-                    <= s.ZopfliMaxCachedSublen(lmcpos))
+                length = cachedLen;
+                if (length > limit) length = (ushort)limit;
+                if (sublen != null)
                 {
-                    length = s.lmc.length[lmcpos];
-                    if (length > limit) length = (ushort)limit;
-                    if (sublen != null)
+                    s.ZopfliCacheToSublen((ulong)lmcpos, length, sublen);
+                    distance = sublen[length];
+                    if (limit == ZOPFLI_MAX_MATCH && length >= ZOPFLI_MIN_MATCH)
                     {
-                        s.ZopfliCacheToSublen(lmcpos, length, sublen);
-                        distance = sublen[length];
-                        if (limit == ZOPFLI_MAX_MATCH && length >= ZOPFLI_MIN_MATCH)
-                        {
-                            Debug.Assert(sublen[length] == s.lmc.dist[lmcpos]);
-                        }
+                        Debug.Assert(sublen[length] == s.lmc.dist[lmcpos]);
                     }
-                    else
-                    {
-                        distance = s.lmc.dist[lmcpos];
-                    }
-                    return 1;
                 }
-                /* Can't use much of the cache, since the "sublens" need to be calculated,
-                   but at  least we already know when to stop. */
-                limit = s.lmc.length[lmcpos];
+                else
+                {
+                    distance = s.lmc.dist[lmcpos];
+                }
+                return 1;
             }
-
+            /* Can't use much of the cache, since the "sublens" need to be calculated,
+               but at least we already know when to stop. */
+            limit = cachedLen;
             return 0;
         }
 
@@ -1296,17 +1302,17 @@ namespace ZopfliCSharp
             }
             Debug.Assert(npoints == nlz77points);
 
-            Console.Write("block split points: ");
+            Console.Error.Write("block split points: ");
             for (i = 0; i < npoints; i++)
             {
-                Console.Write($"{(int)splitpoints[(int)i]} ");
+                Console.Error.Write($"{(int)splitpoints[(int)i]} ");
             }
-            Console.Write("(hex:");
+            Console.Error.Write("(hex:");
             for (i = 0; i < npoints; i++)
             {
-                Console.Write($" {(int)splitpoints[(int)i]:x}");
+                Console.Error.Write($" {(int)splitpoints[(int)i]:x}");
             }
-            Console.Write(")\n");
+            Console.Error.Write(")\n");
         }
 
         /*
@@ -1814,7 +1820,7 @@ namespace ZopfliCSharp
                 AddDynamicTree(ll_lengths, d_lengths, ref bp, OutFile);
                 if (Globals.verbose > 0)
                 {
-                    Console.WriteLine ("treesize: " + (int)(OutFile.Count - detect_tree_size));
+                    Console.Error.WriteLine ("treesize: " + (int)(OutFile.Count - detect_tree_size));
                 }
             }
 
@@ -1835,7 +1841,7 @@ namespace ZopfliCSharp
             compressed_size = (ulong)(OutFile.Count + 10 /* header size*/ - detect_block_size);
             if (Globals.verbose > 0)
             {
-                Console.WriteLine($"compressed block size: {compressed_size} ({compressed_size / 1024}k) (unc: {uncompressed_size})");
+                Console.Error.WriteLine($"compressed block size: {compressed_size} ({compressed_size / 1024}k) (unc: {uncompressed_size})");
             }
         }
 

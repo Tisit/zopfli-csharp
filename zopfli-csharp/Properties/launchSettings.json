@@ -1,8 +1,11 @@
 {
   "profiles": {
-    "zopfli-csharp": {
+    "perf-test": {
       "commandName": "Project",
-      "commandLineArgs": "D:\\treeinfo.wc"
+      "commandLineArgs": "--i15 \"D:\\WinEvents.evtx\""
+    },
+    "no-parameter": {
+      "commandName": "Project"
     }
   }
 }

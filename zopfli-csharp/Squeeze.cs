@@ -1,6 +1,8 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using zopfli_csharp;
 
 namespace ZopfliCSharp
@@ -127,7 +129,7 @@ namespace ZopfliCSharp
         Finds the minimum possible cost this cost model can return for valid length and
         distance symbols.
         */
-        static double GetCostModelMinCost(SymbolStats stats)
+        static double GetCostModelMinCost(SymbolStats stats, bool fixedcosts)
         {
             double mincost;
             int bestlength = 0; /* length that has lowest cost in the cost model */
@@ -147,7 +149,7 @@ namespace ZopfliCSharp
             mincost = ZOPFLI_LARGE_FLOAT;
             for (i = 3; i < 259; i++)
             {
-                double c = GetCostStat(i, 1, stats);
+                double c = fixedcosts ? GetCostFixed(i, 1) : GetCostStat(i, 1, stats);
                 if (c < mincost)
                 {
                     bestlength = i;
@@ -158,7 +160,7 @@ namespace ZopfliCSharp
             mincost = ZOPFLI_LARGE_FLOAT;
             for (i = 0; i < 30; i++)
             {
-                double c = GetCostStat(3, dsymbols[i], stats);
+                double c = fixedcosts ? GetCostFixed(3, dsymbols[i]) : GetCostStat(3, dsymbols[i], stats);
                 if (c < mincost)
                 {
                     bestdist = dsymbols[i];
@@ -166,7 +168,7 @@ namespace ZopfliCSharp
                 }
             }
 
-            return GetCostStat(bestlength, bestdist, stats);
+            return fixedcosts ? GetCostFixed(bestlength, bestdist) : GetCostStat(bestlength, bestdist, stats);
         }
 
         /*
@@ -198,7 +200,7 @@ namespace ZopfliCSharp
             ulong windowstart = (ulong)(instart > ZopfliHash.ZOPFLI_WINDOW_SIZE
                 ? instart - ZopfliHash.ZOPFLI_WINDOW_SIZE : 0);
             double result;
-            double mincost = GetCostModelMinCost(stats);
+            double mincost = GetCostModelMinCost(stats, fixedcosts);
             double mincostaddcostj;
 
             if (instart == inend) return 0;
@@ -235,6 +237,21 @@ namespace ZopfliCSharp
             Array.Fill(costs, (float)Compress.ZOPFLI_LARGE_FLOAT);
             costs[0] = 0;  /* Because it's the start. */
             length_array[0] = 0;
+
+            /* Element-0 refs for the inner length loop. Every index there is provably
+               in range under the loop invariants (jk <= blocksize < costs/length_array
+               length; k <= ZOPFLI_MAX_MATCH < costLen/sublen length; sublen[k] is a
+               distance <= ZOPFLI_WINDOW_SIZE < costDist length), but the JIT can't prove
+               it (kend is a runtime min), so it emits a bounds check per access in this,
+               the hottest loop in the program. Indexing through these refs elides them;
+               the Debug.Asserts below enforce each invariant in Debug builds (compiled
+               out in Release, same pattern as GetMatch). These arrays are never
+               reallocated, and managed byrefs are GC-tracked, so hoisting is safe. */
+            ref float costs0 = ref MemoryMarshal.GetArrayDataReference(costs);
+            ref ushort la0 = ref MemoryMarshal.GetArrayDataReference(length_array);
+            ref double costLen0 = ref MemoryMarshal.GetArrayDataReference(costLen);
+            ref double costDist0 = ref MemoryMarshal.GetArrayDataReference(costDist);
+            ref ushort sublen0 = ref MemoryMarshal.GetArrayDataReference(sublen);
 
             for (i = (ulong)instart; i < (ulong)inend; i++)
             {
@@ -295,22 +312,31 @@ namespace ZopfliCSharp
                 }
                 /* Lengths. */
                 kend = Math.Min(leng, (ulong)inend - i);
-                mincostaddcostj = mincost + costs[j];
-                for (k = 3; k <= kend; k++)
+                float costsj = costs[j];  /* Loop-invariant; also feeds each newCost. */
+                mincostaddcostj = mincost + costsj;
+                int jk = (int)j + 3;  /* Running index for costs[j+k]/length_array[j+k]. */
+                for (k = 3; k <= kend; k++, jk++)
                 {
-                    double newCost;
+                    /* Read costs[j+k] once (it's used by both the early-out and the
+                    comparison below). */
+                    Debug.Assert(jk >= 0 && jk < costs.Length);
+                    float cur = Unsafe.Add(ref costs0, jk);
 
                     /* Calling the cost model is expensive, avoid this if we are already at
                     the minimum possible cost that it can return. */
-                    if (costs[j + k] <= mincostaddcostj) continue;
+                    if (cur <= mincostaddcostj) continue;
 
-                    newCost = costLen[k] + costDist[sublen[k]] + costs[j];
+                    Debug.Assert(k <= ZOPFLI_MAX_MATCH);
+                    ushort sl = Unsafe.Add(ref sublen0, (nint)k);
+                    Debug.Assert(sl <= ZopfliHash.ZOPFLI_WINDOW_SIZE);
+                    double newCost = Unsafe.Add(ref costLen0, (nint)k)
+                                   + Unsafe.Add(ref costDist0, (nint)sl) + costsj;
                     Debug.Assert(newCost >= 0);
-                    if (newCost < costs[j + k])
+                    if (newCost < cur)
                     {
-                        Debug.Assert(k <= ZOPFLI_MAX_MATCH);
-                        costs[j + k] = (float)newCost;
-                        length_array[j + k] = (ushort)k;
+                        Debug.Assert(jk < length_array.Length);
+                        Unsafe.Add(ref costs0, jk) = (float)newCost;
+                        Unsafe.Add(ref la0, jk) = (ushort)k;
                     }
                 }
             }
@@ -507,7 +533,7 @@ namespace ZopfliCSharp
                 cost = ZopfliCalculateBlockSize(currentstore, 0, currentstore.size, 2);
                 if (Globals.verbose_more > 0 || (Globals.verbose > 0 && cost < bestcost))
                 {
-                    Console.WriteLine("Iteration " + i + ": " + cost + " bit");
+                    Console.Error.WriteLine("Iteration " + i + ": " + cost + " bit");
                 }
                 if (cost < bestcost)
                 {
