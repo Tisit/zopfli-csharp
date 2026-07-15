@@ -2,6 +2,8 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Numerics;
+using System.Runtime.CompilerServices;
 using zopfli_csharp;
 
 namespace ZopfliCSharp
@@ -234,8 +236,23 @@ namespace ZopfliCSharp
         */
         static int GetMatch(int scan, int match, int end, byte[] array)
         {
+            /* Compare 8 bytes at a time (like the C version reads size_t words).
+               On the first mismatching word, locate the differing byte via the
+               trailing-zero count of the XOR (little-endian assumed). */
+            int safeEnd = end - 8;
+            ref byte b = ref array[0];
+            while (scan < safeEnd)
+            {
+                ulong x = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref b, scan));
+                ulong y = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref b, match));
+                if (x != y)
+                {
+                    return scan + (BitOperations.TrailingZeroCount(x ^ y) >> 3);
+                }
+                scan += 8; match += 8;
+            }
 
-            /* just do it the naive way */
+            /* Tail: fewer than 8 bytes left, do it the naive way. */
             while (scan < end && array[scan] == array[match])
             {
                 scan++; match++;
@@ -476,11 +493,12 @@ namespace ZopfliCSharp
             return distance > 1024 ? length - 1 : length;
         }
 
+        [Conditional("DEBUG")]
         static public void ZopfliVerifyLenDist(byte[] data, int datasize, int pos,
-                         ushort dist, ushort length) 
+                         ushort dist, ushort length)
         {
 
-            /* TODO(lode): make this only run in a debug compile, it's for assert only. */
+            /* This is verification for asserts only; compiled out in Release. */
             int i;
 
             Debug.Assert(pos + length <= datasize);
@@ -511,36 +529,43 @@ namespace ZopfliCSharp
             each to save memory. */
             if (origsize % ZOPFLI_NUM_LL == 0)
             {
+                store.EnsureLLCountsCapacity(store.ll_counts_size + ZOPFLI_NUM_LL);
                 for (i = 0; i < ZOPFLI_NUM_LL; i++)
                 {
-                    store.ll_counts.Add(origsize == 0 ? 0 : store.ll_counts[origsize - ZOPFLI_NUM_LL + i]);
+                    store.ll_counts[store.ll_counts_size + i] =
+                        origsize == 0 ? 0 : store.ll_counts[origsize - ZOPFLI_NUM_LL + i];
                 }
+                store.ll_counts_size += ZOPFLI_NUM_LL;
             }
 
             if (origsize % ZOPFLI_NUM_D == 0)
             {
+                store.EnsureDCountsCapacity(store.d_counts_size + ZOPFLI_NUM_D);
                 for (i = 0; i < ZOPFLI_NUM_D; i++)
                 {
-                    store.d_counts.Add(origsize == 0 ? 0 : store.d_counts[origsize - ZOPFLI_NUM_D + i]);
+                    store.d_counts[store.d_counts_size + i] =
+                        origsize == 0 ? 0 : store.d_counts[origsize - ZOPFLI_NUM_D + i];
                 }
+                store.d_counts_size += ZOPFLI_NUM_D;
             }
 
-            store.litlens.Add(length);
-            store.dists.Add(dist);
-            store.pos.Add((ulong)pos);
+            store.EnsureMainCapacity(origsize + 1);
+            store.litlens[origsize] = length;
+            store.dists[origsize] = dist;
+            store.pos[origsize] = (ulong)pos;
             Debug.Assert(length < 259);
             store.size++;
 
             if (dist == 0)
             {
-                store.ll_symbol.Add(length);
-                store.d_symbol.Add(0);
+                store.ll_symbol[origsize] = length;
+                store.d_symbol[origsize] = 0;
                 store.ll_counts[llstart + length]++;
             }
             else
             {
-                store.ll_symbol.Add(Symbols.ZopfliGetLengthSymbol(length));
-                store.d_symbol.Add(Symbols.ZopfliGetDistSymbol(dist));
+                store.ll_symbol[origsize] = Symbols.ZopfliGetLengthSymbol(length);
+                store.d_symbol[origsize] = Symbols.ZopfliGetDistSymbol(dist);
                 store.ll_counts[llstart + Symbols.ZopfliGetLengthSymbol(length)]++;
                 store.d_counts[dstart + Symbols.ZopfliGetDistSymbol(dist)]++;
             }

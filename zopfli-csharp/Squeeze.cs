@@ -209,6 +209,28 @@ namespace ZopfliCSharp
 
             if (instart == inend) return 0;
 
+            /* Precompute the length- and distance-dependent parts of the cost model.
+               For dist > 0 the cost is separable: cost(len, dist) = costLen[len] +
+               costDist[dist]. This turns the inner cost loop into two array lookups
+               instead of repeated symbol/extra-bit function calls per position. */
+            double[] costLen = new double[ZOPFLI_MAX_MATCH + 1];
+            double[] costDist = new double[ZopfliHash.ZOPFLI_WINDOW_SIZE + 1];
+            for (int len = ZOPFLI_MIN_MATCH; len <= ZOPFLI_MAX_MATCH; len++)
+            {
+                int lbits = Symbols.ZopfliGetLengthExtraBits(len);
+                int lsym = Symbols.ZopfliGetLengthSymbol((ushort)len);
+                costLen[len] = fixedcosts
+                    ? lbits + (lsym <= 279 ? 7 : 8)
+                    : lbits + stats.ll_symbols[lsym];
+            }
+            for (int d = 1; d <= ZopfliHash.ZOPFLI_WINDOW_SIZE; d++)
+            {
+                int dbits = Symbols.ZopfliGetDistExtraBits(d);
+                costDist[d] = fixedcosts
+                    ? dbits + 5
+                    : dbits + stats.d_symbols[Symbols.ZopfliGetDistSymbol((ushort)d)];
+            }
+
             h.ZopfliResetHash();
             h.ZopfliWarmupHash(InFile, (int)windowstart, inend);
             for (i = windowstart; i < (ulong)instart; i++)
@@ -288,14 +310,7 @@ namespace ZopfliCSharp
                     the minimum possible cost that it can return. */
                     if (costs[j + k] <= mincostaddcostj) continue;
 
-                    if (fixedcosts)
-                    {
-                        newCost = GetCostFixed((int)k, sublen[k]) + costs[j];
-                    }
-                    else
-                    {
-                        newCost = GetCostStat((int)k, sublen[k], stats) + costs[j];
-                    }
+                    newCost = costLen[k] + costDist[sublen[k]] + costs[j];
                     Debug.Assert(newCost >= 0);
                     if (newCost < costs[j + k])
                     {
@@ -406,15 +421,26 @@ namespace ZopfliCSharp
         static void ZopfliCopyLZ77Store(
             ZopfliLZ77Store source, ZopfliLZ77Store dest)
         {
-            dest.ResetStore(source.data);
-            dest.litlens = new List<ushort>(source.litlens);
-            dest.ll_counts = new List<ulong>(source.ll_counts);
-            dest.d_counts = new List<ulong>(source.d_counts);
-            dest.ll_symbol = new List<ushort>(source.ll_symbol);
-            dest.d_symbol = new List<ushort>(source.d_symbol);
-            dest.pos = new List<ulong>(source.pos);
-            dest.dists = new List<ushort>(source.dists);
+            dest.data = source.data;
             dest.size = source.size;
+
+            int n = (int)source.size;
+            dest.EnsureMainCapacity(n);
+            Array.Copy(source.litlens, dest.litlens, n);
+            Array.Copy(source.dists, dest.dists, n);
+            Array.Copy(source.pos, dest.pos, n);
+            Array.Copy(source.ll_symbol, dest.ll_symbol, n);
+            Array.Copy(source.d_symbol, dest.d_symbol, n);
+
+            if (dest.ll_counts.Length < source.ll_counts_size)
+                dest.ll_counts = new ulong[source.ll_counts_size];
+            Array.Copy(source.ll_counts, dest.ll_counts, source.ll_counts_size);
+            dest.ll_counts_size = source.ll_counts_size;
+
+            if (dest.d_counts.Length < source.d_counts_size)
+                dest.d_counts = new ulong[source.d_counts_size];
+            Array.Copy(source.d_counts, dest.d_counts, source.d_counts_size);
+            dest.d_counts_size = source.d_counts_size;
         }
 
         /*

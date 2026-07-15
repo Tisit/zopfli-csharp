@@ -5,23 +5,28 @@ using ZopfliCSharp;
 
 class ZopfliLZ77Store
 {
-    public List<ushort> litlens;  /* Lit or len. */
-    public List<ushort> dists;  /* If 0: indicates literal in corresponding litlens,
+    /* The per-symbol arrays below are parallel and have logical length `size`.
+       Their allocated capacity may be larger; grow via EnsureMainCapacity. */
+    public ushort[] litlens;  /* Lit or len. */
+    public ushort[] dists;  /* If 0: indicates literal in corresponding litlens,
       if > 0: length in corresponding litlens, this is the distance. */
     public ulong size;
 
     public byte[] data;  /* original data */
-    public List<ulong> pos;  /* position in data where this LZ77 command begins */
+    public ulong[] pos;  /* position in data where this LZ77 command begins */
 
-    public List<ushort> ll_symbol;
-    public List<ushort> d_symbol;
+    public ushort[] ll_symbol;
+    public ushort[] d_symbol;
 
     /* Cumulative histograms wrapping around per chunk. Each chunk has the amount
     of distinct symbols as length, so using 1 value per LZ77 symbol, we have a
     precise histogram at every N symbols, and the rest can be calculated by
-    looping through the actual symbols of this chunk. */
-    public List<ulong> ll_counts;
-    public List<ulong> d_counts;
+    looping through the actual symbols of this chunk. Logical lengths are
+    ll_counts_size / d_counts_size. */
+    public ulong[] ll_counts;
+    public ulong[] d_counts;
+    public int ll_counts_size;
+    public int d_counts_size;
 
     //ZopfliInitLZ77Store() from original
     public ZopfliLZ77Store(byte[] indata)
@@ -34,15 +39,49 @@ class ZopfliLZ77Store
     }
     void SetDefaults(byte[] indata)
     {
-        litlens = new List<ushort>();
-        dists = new List<ushort>();
+        const int cap = 16;
+        litlens = new ushort[cap];
+        dists = new ushort[cap];
         size = 0;
         data = indata;
-        pos = new List<ulong>();
-        ll_symbol = new List<ushort>();
-        d_symbol = new List<ushort>();
-        ll_counts = new List<ulong>();
-        d_counts = new List<ulong>();
+        pos = new ulong[cap];
+        ll_symbol = new ushort[cap];
+        d_symbol = new ushort[cap];
+        ll_counts = Array.Empty<ulong>();
+        d_counts = Array.Empty<ulong>();
+        ll_counts_size = 0;
+        d_counts_size = 0;
+    }
+
+    /* Ensures the parallel per-symbol arrays hold at least `needed` elements. */
+    public void EnsureMainCapacity(int needed)
+    {
+        if (litlens.Length >= needed) return;
+        int cap = litlens.Length * 2;
+        if (cap < needed) cap = needed;
+        Array.Resize(ref litlens, cap);
+        Array.Resize(ref dists, cap);
+        Array.Resize(ref pos, cap);
+        Array.Resize(ref ll_symbol, cap);
+        Array.Resize(ref d_symbol, cap);
+    }
+
+    /* Grows the histogram arrays with doubling (amortized O(1)); a fixed-step
+       Array.Resize per chunk would be quadratic over the whole store. */
+    public void EnsureLLCountsCapacity(int needed)
+    {
+        if (ll_counts.Length >= needed) return;
+        int cap = ll_counts.Length == 0 ? needed : ll_counts.Length * 2;
+        if (cap < needed) cap = needed;
+        Array.Resize(ref ll_counts, cap);
+    }
+
+    public void EnsureDCountsCapacity(int needed)
+    {
+        if (d_counts.Length >= needed) return;
+        int cap = d_counts.Length == 0 ? needed : d_counts.Length * 2;
+        if (cap < needed) cap = needed;
+        Array.Resize(ref d_counts, cap);
     }
 }
 
@@ -131,19 +170,21 @@ class ZopfliBlockState
                          ulong pos, ulong length,
                          ushort[] sublen)
     {
-        ulong i, j;
-        uint maxlength = ZopfliMaxCachedSublen(pos);
-        int prevlength = 0;
-
         if (length < 3) return;
-        for (j = 0; j < ZOPFLI_CACHE_LENGTH; j++)
+        uint maxlength = ZopfliMaxCachedSublen(pos);
+        /* Hoist the per-position base index and array reference out of the loop,
+           and fill each length-range with a vectorized Array.Fill instead of a
+           scalar ulong-indexed loop. This method is ~13% of total runtime. */
+        int cachebase = (int)(ZOPFLI_CACHE_LENGTH * pos * 3);
+        byte[] cs = lmc.sublen;
+        int prevlength = 0;
+        for (int j = 0; j < ZOPFLI_CACHE_LENGTH; j++)
         {
-            int length2 = lmc.sublen[ZOPFLI_CACHE_LENGTH * pos * 3 + j * 3] + 3;
-            int dist = lmc.sublen[ZOPFLI_CACHE_LENGTH * pos * 3 + j * 3 + 1] + 256 * lmc.sublen[ZOPFLI_CACHE_LENGTH * pos * 3 + j * 3 + 2];
-            for (i = (ulong)prevlength; i <= (ulong)length2; i++)
-            {
-                sublen[i] = (ushort)dist;
-            }
+            int o = cachebase + j * 3;
+            int length2 = cs[o] + 3;
+            ushort dist = (ushort)(cs[o + 1] + 256 * cs[o + 2]);
+            int count = length2 - prevlength + 1;
+            if (count > 0) Array.Fill(sublen, dist, prevlength, count);
             if (length2 == maxlength) break;
             prevlength = length2 + 1;
         }
