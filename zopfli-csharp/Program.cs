@@ -81,7 +81,12 @@ namespace ZopfliCSharp
                 Console.CancelKeyPress += onCancel;
                 try
                 {
-                    using (FileStream outFile = new FileStream(tempPath, FileMode.Create, FileAccess.Write))
+                    /* FileShare.Delete lets the cancel handler (or any concurrent
+                       cleanup) remove the temp file while this handle is still open.
+                       On Windows that marks it delete-pending, so the OS erases it as
+                       soon as the handle closes during process teardown -- otherwise a
+                       Ctrl+C landing mid-write would leave the temp behind. */
+                    using (FileStream outFile = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.Read | FileShare.Delete))
                     using (BufferedStream bs = new BufferedStream(outFile, 1 << 16))
                     {
                         Compress.ZopfliCompress(inStream, bs);
