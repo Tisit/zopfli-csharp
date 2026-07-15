@@ -217,9 +217,6 @@ namespace zopfli_csharp
             a time, so each list is a array of two Node*'s. */
             Node[,] lists;
 
-            /* One leaf per symbol. Only numsymbols leaves will be used. */
-            //Node[] leaves = Helpers.InitializeArray<Node>(n);
-
             /* Initialize all bitlengths at 0. */
             bitlengths.Initialize();
 
@@ -231,8 +228,6 @@ namespace zopfli_csharp
                     numsymbols++;
                 }
             }
-
-            Helpers.DebugCounter++;
 
             Node[] leaves = InitializeLeaves(numsymbols).ToArray();
             int SymbolNumber = 0;
@@ -272,10 +267,13 @@ namespace zopfli_csharp
 
             /* Sort the leaves from lightest to heaviest. Add count into the same
             variable for stable sorting. */
+            /* weight is a 32-bit uint and the low 9 bits are used to pack the count for
+               stable sorting, so a weight must fit in the remaining 23 bits. (The C
+               original uses size_t weights and thus a 55-bit limit; here it is 23.) */
+            const uint MAX_SORT_WEIGHT = 1u << (32 - 9);
             for (i = 0; i < numsymbols; i++)
             {
-                if (leaves[i].weight >=
-                    (ulong)(1 << (int)(sizeof(ulong) * leaves[0].weight * CHAR_BIT - 9))) 
+                if (leaves[i].weight >= MAX_SORT_WEIGHT)
                 {
                     return 1;  /* Error, we need 9 bits for the count. */
                 }

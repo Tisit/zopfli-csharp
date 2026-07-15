@@ -27,11 +27,6 @@ namespace ZopfliCSharp
         static public int blocksplitting = 1;
 
         /*
-        No longer used, left for compatibility.
-        */
-        static public int blocksplittinglast = 0;
-
-        /*
         Maximum amount of blocks to split into (0 for unlimited, but this can give
         extreme results that hurt compression on some files). Default value: 15.
         */
@@ -49,24 +44,74 @@ namespace ZopfliCSharp
         static void CompressFile()
         {
             /* Stream both input and output so the whole file and the whole compressed
-               result are never held in memory at once. */
-            using (FileStream inStream = new FileStream(Globals.filename, FileMode.Open,
-                       FileAccess.Read, FileShare.Read, 1 << 16))
+               result are never held in memory at once. File I/O errors (missing file,
+               permission denied, unwritable target) are reported cleanly rather than
+               surfacing as an unhandled exception with a stack trace. */
+            try
             {
+                using FileStream inStream = new FileStream(Globals.filename, FileMode.Open,
+                    FileAccess.Read, FileShare.Read, 1 << 16);
+
                 if (inStream.Length > 2147483647)
                 {
                     Console.WriteLine("Files larger than 2GB are not supported.");
                     Environment.Exit(1);
                 }
 
-                Stream outStream = (Globals.outfilename != "")
-                    ? new FileStream(Globals.outfilename, FileMode.Create, FileAccess.Write)
-                    : Console.OpenStandardOutput();
-                using (BufferedStream bs = new BufferedStream(outStream, 1 << 16))
+                if (Globals.outfilename == "")
                 {
-                    Compress.ZopfliCompress(inStream, bs);
+                    /* Streaming to stdout: there is no file to make atomic. */
+                    using Stream stdout = Console.OpenStandardOutput();
+                    using BufferedStream sbs = new BufferedStream(stdout, 1 << 16);
+                    Compress.ZopfliCompress(inStream, sbs);
+                    return;
+                }
+
+                /* Write to a temporary file in the same directory, force its bytes to
+                   physical media, then atomically replace the target. A crash, Ctrl+C,
+                   or power loss therefore leaves either the previous output (if any) or
+                   the complete new file on disk -- never a partial or corrupt one. The
+                   temp is removed on any failure. This uses only portable BCL APIs, so
+                   it behaves the same on Windows (FlushFileBuffers + MoveFileEx) and
+                   Linux (fsync + rename). */
+                string finalPath = Globals.outfilename;
+                string tempPath = finalPath + ".tmp" + Environment.ProcessId;
+
+                ConsoleCancelEventHandler onCancel = (s, e) => TryDelete(tempPath);
+                Console.CancelKeyPress += onCancel;
+                try
+                {
+                    using (FileStream outFile = new FileStream(tempPath, FileMode.Create, FileAccess.Write))
+                    using (BufferedStream bs = new BufferedStream(outFile, 1 << 16))
+                    {
+                        Compress.ZopfliCompress(inStream, bs);
+                        bs.Flush();
+                        outFile.Flush(flushToDisk: true);  /* fsync / FlushFileBuffers */
+                    }
+                    File.Move(tempPath, finalPath, overwrite: true);  /* atomic replace */
+                }
+                catch
+                {
+                    TryDelete(tempPath);
+                    throw;
+                }
+                finally
+                {
+                    Console.CancelKeyPress -= onCancel;
                 }
             }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+            {
+                Console.WriteLine("Error: " + ex.Message);
+                Environment.Exit(1);
+            }
+        }
+
+        /* Best-effort removal of a temp file; a leftover temp is harmless clutter. */
+        static void TryDelete(string path)
+        {
+            try { File.Delete(path); }
+            catch { /* ignore */ }
         }
 
         static int Main(string[] args)
@@ -111,11 +156,15 @@ namespace ZopfliCSharp
                         );
                         return 0;
                     default:
-                        if (arg[0] == '-' && arg[1] == '-' && arg[2] == 'i' && arg[3] >= '0' && arg[3] <= '9')
+                        if (arg.Length >= 4 && arg[0] == '-' && arg[1] == '-' && arg[2] == 'i' && arg[3] >= '0' && arg[3] <= '9')
                         {
-                            Globals.numiterations = Int32.Parse(arg.Substring(3));
+                            if (!Int32.TryParse(arg.Substring(3), out Globals.numiterations))
+                            {
+                                Console.WriteLine("Error: invalid iteration count in '" + arg + "'");
+                                return 1;
+                            }
                         }
-                        else if (arg[0] != '-')
+                        else if (arg.Length > 0 && arg[0] != '-')
                         {
                             Globals.filename = arg;
                             if (Globals.output_to_stdout)
@@ -163,24 +212,5 @@ namespace ZopfliCSharp
 
             return 0;
         }
-    }
-
-    static class Helpers
-    {
-        //taken from
-        //https://stackoverflow.com/questions/3301678/how-to-declare-an-array-of-objects-in-c-sharp
-        static public T[] InitializeArray<T>(int length) where T : new()
-        {
-            T[] array = new T[length];
-            for (int i = 0; i < length; ++i)
-            {
-                array[i] = new T();
-            }
-
-            return array;
-        }
-
-        //used for debugging
-        public static ulong DebugCounter = 0;
     }
 }

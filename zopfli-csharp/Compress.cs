@@ -113,17 +113,6 @@ namespace ZopfliCSharp
           3020668471, 3272380065, 1510334235,  755167117
         };
 
-        /* Returns the CRC32 */
-        static ulong CRC(byte[] data, int size) 
-        {
-            ulong result = 0xffffffff;
-            for (int i = 0; size > 0; size--, i++) 
-            {
-                result = crc32_table[(result ^ data[i]) & 0xff] ^ (result >> 8);
-            }
-            return result ^ 0xffffffff;
-        }
-
         /* Incremental checksums so the input can be streamed one chunk at a time
            rather than scanned in full up front. */
         abstract class Checksum
@@ -210,8 +199,8 @@ namespace ZopfliCSharp
 
             if (Globals.verbose == 1)
             {
-               Console.WriteLine("Original Size: "+ inLength + ", Gzip: " + OutFile.Count +
-                   " , Compression: " + 100.0 * (double)(inLength - OutFile.Count) / (double)inLength + " Removed");
+               Console.WriteLine($"Original Size: {inLength}, Gzip: {OutFile.Count} , Compression: " +
+                   $"{100.0 * (inLength - OutFile.Count) / inLength} Removed");
             }
         }
 
@@ -239,9 +228,8 @@ namespace ZopfliCSharp
 
             if (Globals.verbose > 0)
             {
-                Console.WriteLine(
-                        "Original Size: " + inLength + ", Zlib: " + OutFile.Count + ", Compression: "
-                        + 100.0 * (double)(inLength - OutFile.Count) / (double)inLength + "% Removed");
+                Console.WriteLine($"Original Size: {inLength}, Zlib: {OutFile.Count}, Compression: " +
+                        $"{100.0 * (inLength - OutFile.Count) / inLength}% Removed");
             }
         }
 
@@ -258,8 +246,7 @@ namespace ZopfliCSharp
             const int WINDOW = ZopfliHash.ZOPFLI_WINDOW_SIZE;
             byte[] buffer = new byte[WINDOW + ZOPFLI_MASTER_BLOCK_SIZE];
 
-            byte[] bp = new byte[1];
-            bp[0] = 0;
+            int bp = 0;
 
             long mbStart = 0;
             int prevBufLen = 0;
@@ -285,7 +272,7 @@ namespace ZopfliCSharp
 
                 /* Buffer-relative coordinates: the master block starts right after the
                    retained history and ends at the end of the buffered data. */
-                ZopfliDeflatePart(btype, final2, buffer, history, bufLen, bp, OutFile);
+                ZopfliDeflatePart(btype, final2, buffer, history, bufLen, ref bp, OutFile);
                 checksum.Update(buffer, history, toRead);
 
                 mbStart = mbEnd;
@@ -308,7 +295,14 @@ namespace ZopfliCSharp
         {
             /* Compare 8 bytes at a time (like the C version reads size_t words).
                On the first mismatching word, locate the differing byte via the
-               trailing-zero count of the XOR (little-endian assumed). */
+               trailing-zero count of the XOR (little-endian assumed).
+
+               Safety invariant for the unchecked Unsafe reads below: the widest word
+               read starts at scan < safeEnd = end - 8, so it touches indices up to
+               end - 1, and match < scan, so both reads stay within [0, end) and end
+               must be within the array. These asserts document and enforce that. */
+            Debug.Assert(scan >= 0 && match >= 0 && match <= scan);
+            Debug.Assert(end <= array.Length);
             int safeEnd = end - 8;
             ref byte b = ref array[0];
             while (scan < safeEnd)
@@ -642,7 +636,6 @@ namespace ZopfliCSharp
 
         }
 
-        //TODO: doesn't work entirely correctly. WHYYYY???
         static void ZopfliLZ77Greedy(ZopfliBlockState s, byte[] InFile, int instart, int inend, ZopfliLZ77Store store, ZopfliHash h)
         {
             int i, j;
@@ -747,12 +740,11 @@ namespace ZopfliCSharp
 
         static void GetFixedTree(uint[] ll_lengths, uint[] d_lengths)
         {
-            ulong i;
-            for (i = 0; i < 144; i++) ll_lengths[i] = 8;
-            for (i = 144; i < 256; i++) ll_lengths[i] = 9;
-            for (i = 256; i < 280; i++) ll_lengths[i] = 7;
-            for (i = 280; i < 288; i++) ll_lengths[i] = 8;
-            for (i = 0; i < 32; i++) d_lengths[i] = 5;
+            Array.Fill(ll_lengths, 8u, 0, 144);
+            Array.Fill(ll_lengths, 9u, 144, 256 - 144);
+            Array.Fill(ll_lengths, 7u, 256, 280 - 256);
+            Array.Fill(ll_lengths, 8u, 280, 288 - 280);
+            Array.Fill(d_lengths, 5u, 0, 32);
         }
 
         static ulong CalculateBlockSymbolSizeSmall( uint[] ll_lengths,
@@ -1296,6 +1288,7 @@ namespace ZopfliCSharp
                     if (lz77splitpoints[(int)npoints] == i)
                     {
                         splitpoints.Add(pos);
+                        npoints++;
                         if (npoints == nlz77points) break;
                     }
                     pos += length;
@@ -1306,12 +1299,12 @@ namespace ZopfliCSharp
             Console.Write("block split points: ");
             for (i = 0; i < npoints; i++)
             {
-                Console.Write("%d ", (int)splitpoints[(int)i]);
+                Console.Write($"{(int)splitpoints[(int)i]} ");
             }
             Console.Write("(hex:");
             for (i = 0; i < npoints; i++)
             {
-                Console.Write(" %x", (int)splitpoints[(int)i]);
+                Console.Write($" {(int)splitpoints[(int)i]:x}");
             }
             Console.Write(")\n");
         }
@@ -1371,25 +1364,25 @@ namespace ZopfliCSharp
         whole byte. It is: (bp == 0) ? (bytesize * 8) : ((bytesize - 1) * 8 + bp)
         */
         static void AddBit(int bit,
-                            byte[] bp, OutputSink OutFile)
+                            ref int bp, OutputSink OutFile)
         {
-            if (bp[0] == 0) OutFile.Add(0);
-            OutFile[OutFile.Count - 1] |= (byte)(bit << bp[0]);
-            bp[0] = (byte)((bp[0] + 1) & 7);
+            if (bp == 0) OutFile.Add(0);
+            OutFile[OutFile.Count - 1] |= (byte)(bit << bp);
+            bp = (byte)((bp + 1) & 7);
         }
 
 
         static void AddBits(uint symbol, uint length,
-                    byte[] bp, OutputSink OutFile)
+                    ref int bp, OutputSink OutFile)
         {
             /* TODO(lode): make more efficient (add more bits at once). */
             ushort i;
             for (i = 0; i < length; i++)
             {
                 uint bit = (symbol >> i) & 1;
-                if (bp[0] == 0) OutFile.Add(0);
-                OutFile[OutFile.Count - 1] |= (byte)(bit << bp[0]);
-                bp[0] = (byte)((bp[0] + 1) & 7);
+                if (bp == 0) OutFile.Add(0);
+                OutFile[OutFile.Count - 1] |= (byte)(bit << bp);
+                bp = (byte)((bp + 1) & 7);
             }
         }
 
@@ -1398,16 +1391,16 @@ namespace ZopfliCSharp
         uses both orders in one standard.
         */
         static void AddHuffmanBits(uint symbol, uint length,
-                                   byte[] bp, OutputSink OutFile)
+                                   ref int bp, OutputSink OutFile)
         {
             /* TODO(lode): make more efficient (add more bits at once). */
             uint i;
             for (i = 0; i < length; i++)
             {
                 uint bit = (symbol >> (ushort)(length - i - 1)) & 1;
-                if (bp[0] == 0) OutFile.Add(0);
-                OutFile[OutFile.Count - 1] |= (byte)(bit << bp[0]);
-                bp[0] = (byte)((bp[0] + 1) & 7);
+                if (bp == 0) OutFile.Add(0);
+                OutFile[OutFile.Count - 1] |= (byte)(bit << bp);
+                bp = (byte)((bp + 1) & 7);
             }
         }
 
@@ -1419,10 +1412,7 @@ namespace ZopfliCSharp
             uint bits, i;
             uint code;
 
-            for (i = 0; i < n; i++)
-            {
-                symbols[i] = 0;
-            }
+            Array.Clear(symbols, 0, (int)n);
 
             /* 1) Count the number of codes for each code length. Let bl_count[N] be the
             number of codes of length N, N >= 1. */
@@ -1464,7 +1454,7 @@ namespace ZopfliCSharp
         static ulong EncodeTree(uint[] ll_lengths,
                          uint[] d_lengths,
                          bool use_16, bool use_17, bool use_18,
-                         byte[] bp,
+                         ref int bp,
                          OutputSink OutFile, bool size_only)
         {
             uint lld_total;  /* Total amount of literal, length, distance codes. */
@@ -1583,23 +1573,23 @@ namespace ZopfliCSharp
 
             if (!size_only)
             {
-                AddBits(hlit, 5, bp, OutFile);
-                AddBits(hdist, 5, bp, OutFile);
-                AddBits(hclen, 4, bp, OutFile);
+                AddBits(hlit, 5, ref bp, OutFile);
+                AddBits(hdist, 5, ref bp, OutFile);
+                AddBits(hclen, 4, ref bp, OutFile);
 
                 for (i = 0; i < hclen + 4; i++)
                 {
-                    AddBits(clcl[EncodeTreeOrder[i]], 3, bp, OutFile);
+                    AddBits(clcl[EncodeTreeOrder[i]], 3, ref bp, OutFile);
                 }
 
                 for (int ii = 0; ii < (int)rle.Count; ii++)
                 {
                     uint symbol = clsymbols[rle[ii]];
-                    AddHuffmanBits(symbol, clcl[rle[ii]], bp, OutFile);
+                    AddHuffmanBits(symbol, clcl[rle[ii]], ref bp, OutFile);
                     /* Extra bits. */
-                    if (rle[ii] == 16) AddBits(rle_bits[ii], 2, bp, OutFile);
-                    else if (rle[ii] == 17) AddBits(rle_bits[ii], 3, bp, OutFile);
-                    else if (rle[ii] == 18) AddBits(rle_bits[ii], 7, bp, OutFile);
+                    if (rle[ii] == 16) AddBits(rle_bits[ii], 2, ref bp, OutFile);
+                    else if (rle[ii] == 17) AddBits(rle_bits[ii], 3, ref bp, OutFile);
+                    else if (rle[ii] == 18) AddBits(rle_bits[ii], 7, ref bp, OutFile);
                 }
             }
 
@@ -1621,7 +1611,7 @@ namespace ZopfliCSharp
 
         static void AddDynamicTree(uint[] ll_lengths,
                            uint[] d_lengths,
-                           byte[] bp,
+                           ref int bp,
                            OutputSink OutFile)
         {
             int i;
@@ -1631,8 +1621,8 @@ namespace ZopfliCSharp
             for (i = 0; i < 8; i++)
             {
                 ulong size = EncodeTree(ll_lengths, d_lengths,
-                                         Convert.ToBoolean(i & 1), Convert.ToBoolean(i & 2), Convert.ToBoolean(i & 4),
-                                         bp, OutFile, true);
+                                         (i & 1) != 0, (i & 2) != 0, (i & 4) != 0,
+                                         ref bp, OutFile, true);
                 if (bestsize == 0 || size < bestsize)
                 {
                     bestsize = size;
@@ -1641,8 +1631,8 @@ namespace ZopfliCSharp
             }
 
             EncodeTree(ll_lengths, d_lengths,
-                       Convert.ToBoolean(best & 1), Convert.ToBoolean(best & 2), Convert.ToBoolean(best & 4),
-                       bp, OutFile, false);
+                       (best & 1) != 0, (best & 2) != 0, (best & 4) != 0,
+                       ref bp, OutFile, false);
         }
 
         /*
@@ -1655,14 +1645,14 @@ namespace ZopfliCSharp
             int i;
             //these are only used to have all parameters for EncodeTree
             //(size_only is always true here, so nothing is ever written to it)
-            byte[] DummyBP = new byte[1];
+            int DummyBP = 0;
             OutputSink DummyOutFIle = new OutputSink(Stream.Null);
 
             for (i = 0; i < 8; i++)
             {
                 ulong size = EncodeTree(ll_lengths, d_lengths,
-                                         Convert.ToBoolean(i & 1), Convert.ToBoolean(i & 2), Convert.ToBoolean(i & 4),
-                                         DummyBP, DummyOutFIle, true);
+                                         (i & 1) != 0, (i & 2) != 0, (i & 4) != 0,
+                                         ref DummyBP, DummyOutFIle, true);
                 if (result == 0 || size < result) result = size;
             }
 
@@ -1679,7 +1669,7 @@ namespace ZopfliCSharp
                                 ulong expected_data_size,
                         uint[] ll_symbols, uint[] ll_lengths,
                         uint[] d_symbols, uint[] d_lengths,
-                        byte[] bp,
+                        ref int bp,
                         OutputSink OutFile)
         {
             ulong testlength = 0;
@@ -1693,7 +1683,7 @@ namespace ZopfliCSharp
                 {
                     Debug.Assert(litlen < 256);
                     Debug.Assert(ll_lengths[litlen] > 0);
-                    AddHuffmanBits(ll_symbols[litlen], ll_lengths[litlen], bp, OutFile);
+                    AddHuffmanBits(ll_symbols[litlen], ll_lengths[litlen], ref bp, OutFile);
                     testlength++;
                 }
                 else
@@ -1703,14 +1693,14 @@ namespace ZopfliCSharp
                     Debug.Assert(litlen >= 3 && litlen <= 288);
                     Debug.Assert(ll_lengths[lls] > 0);
                     Debug.Assert(d_lengths[ds] > 0);
-                    AddHuffmanBits(ll_symbols[lls], ll_lengths[lls], bp, OutFile);
+                    AddHuffmanBits(ll_symbols[lls], ll_lengths[lls], ref bp, OutFile);
                     AddBits(Symbols.ZopfliGetLengthExtraBitsValue((ushort)litlen),
                             (uint)Symbols.ZopfliGetLengthExtraBits((int)litlen),
-                            bp, OutFile);
-                    AddHuffmanBits(d_symbols[ds], d_lengths[ds], bp, OutFile);
+                            ref bp, OutFile);
+                    AddHuffmanBits(d_symbols[ds], d_lengths[ds], ref bp, OutFile);
                     AddBits((uint)Symbols.ZopfliGetDistExtraBitsValue((int)dist),
                             (uint)Symbols.ZopfliGetDistExtraBits((int)dist),
-                            bp, OutFile);
+                            ref bp, OutFile);
                     testlength += litlen;
                 }
             }
@@ -1722,7 +1712,7 @@ namespace ZopfliCSharp
         static void AddNonCompressedBlock(bool final,
                                           byte[] InFile, ulong instart,
                                           ulong inend,
-                                          byte[] bp,
+                                          ref int bp,
                                           OutputSink OutFile)
         {
             ulong pos = instart;
@@ -1738,13 +1728,13 @@ namespace ZopfliCSharp
 
                 nlen = (ushort)~blocksize;
 
-                AddBit(Convert.ToInt32(final && currentfinal), bp, OutFile);
+                AddBit(Convert.ToInt32(final && currentfinal), ref bp, OutFile);
                 /* BTYPE 00 */
-                AddBit(0, bp, OutFile);
-                AddBit(0, bp, OutFile);
+                AddBit(0, ref bp, OutFile);
+                AddBit(0, ref bp, OutFile);
 
                 /* Any bits of input up to the next byte boundary are ignored. */
-                bp[0] = 0;
+                bp = 0;
 
                 OutFile.Add((byte)(blocksize % 256));
                 OutFile.Add((byte)(blocksize / 256));
@@ -1782,7 +1772,7 @@ namespace ZopfliCSharp
                          ZopfliLZ77Store lz77,
                          ulong lstart, ulong lend,
                          ulong expected_data_size,
-                         byte[] bp,
+                         ref int bp,
                          OutputSink OutFile)
         {
             uint[] ll_lengths = new uint[ZOPFLI_NUM_LL];
@@ -1799,13 +1789,13 @@ namespace ZopfliCSharp
                 ulong pos = lstart == lend ? 0 : lz77.pos[(int)lstart];
                 ulong end = pos + length;
                 AddNonCompressedBlock(final,
-                                      lz77.data, pos, end, bp, OutFile);
+                                      lz77.data, pos, end, ref bp, OutFile);
                 return;
             }
 
-            AddBit(Convert.ToInt32(final), bp, OutFile);
-            AddBit(btype & 1, bp, OutFile);
-            AddBit((btype & 2) >> 1, bp, OutFile);
+            AddBit(Convert.ToInt32(final), ref bp, OutFile);
+            AddBit(btype & 1, ref bp, OutFile);
+            AddBit((btype & 2) >> 1, ref bp, OutFile);
 
             if (btype == 1)
             {
@@ -1821,7 +1811,7 @@ namespace ZopfliCSharp
                 GetDynamicLengths(lz77, lstart, lend, ll_lengths, d_lengths);
 
                 detect_tree_size = (uint)OutFile.Count + 10 /* header size*/;
-                AddDynamicTree(ll_lengths, d_lengths, bp, OutFile);
+                AddDynamicTree(ll_lengths, d_lengths, ref bp, OutFile);
                 if (Globals.verbose > 0)
                 {
                     Console.WriteLine ("treesize: " + (int)(OutFile.Count - detect_tree_size));
@@ -1834,9 +1824,9 @@ namespace ZopfliCSharp
             detect_block_size = OutFile.Count + 10 /* header size*/;
             AddLZ77Data(lz77, lstart, lend, expected_data_size,
                         ll_symbols, ll_lengths, d_symbols, d_lengths,
-                        bp, OutFile);
+                        ref bp, OutFile);
             /* End symbol. */
-            AddHuffmanBits(ll_symbols[256], ll_lengths[256], bp, OutFile);
+            AddHuffmanBits(ll_symbols[256], ll_lengths[256], ref bp, OutFile);
 
             for (i = lstart; i < lend; i++)
             {
@@ -1845,8 +1835,7 @@ namespace ZopfliCSharp
             compressed_size = (ulong)(OutFile.Count + 10 /* header size*/ - detect_block_size);
             if (Globals.verbose > 0)
             {
-                Console.WriteLine("compressed block size: %d (%dk) (unc: %d)" + compressed_size + "(" + compressed_size / 1024 + "k) (unc: "
-                       + uncompressed_size + ")");
+                Console.WriteLine($"compressed block size: {compressed_size} ({compressed_size / 1024}k) (unc: {uncompressed_size})");
             }
         }
 
@@ -1854,7 +1843,7 @@ namespace ZopfliCSharp
                                  ZopfliLZ77Store lz77,
                                  ulong lstart, ulong lend,
                                  ulong expected_data_size,
-                                 byte[] bp,
+                                 ref int bp,
                                  OutputSink OutFilePart)
         {
 
@@ -1871,9 +1860,9 @@ namespace ZopfliCSharp
             if (lstart == lend)
             {
                 /* Smallest empty block is represented by fixed block */
-                AddBits(Convert.ToUInt32(final), 1, bp, OutFilePart);
-                AddBits(1, 2, bp, OutFilePart);  /* btype 01 */
-                AddBits(0, 7, bp, OutFilePart);  /* end symbol has code 0000000 */
+                AddBits(Convert.ToUInt32(final), 1, ref bp, OutFilePart);
+                AddBits(1, 2, ref bp, OutFilePart);  /* btype 01 */
+                AddBits(0, 7, ref bp, OutFilePart);  /* end symbol has code 0000000 */
                 return;
             }
             if (expensivefixed)
@@ -1890,25 +1879,25 @@ namespace ZopfliCSharp
             if (uncompressedcost < fixedcost && uncompressedcost < dyncost)
             {
                 AddLZ77Block(0, final, lz77, lstart, lend,
-                             expected_data_size, bp, OutFilePart);
+                             expected_data_size, ref bp, OutFilePart);
             }
             else if (fixedcost < dyncost)
             {
                 if (expensivefixed)
                 {
                     AddLZ77Block(1, final, fixedstore, 0, fixedstore.size,
-                                 expected_data_size, bp, OutFilePart);
+                                 expected_data_size, ref bp, OutFilePart);
                 }
                 else
                 {
                     AddLZ77Block(1, final, lz77, lstart, lend,
-                                 expected_data_size, bp, OutFilePart);
+                                 expected_data_size, ref bp, OutFilePart);
                 }
             }
             else
             {
                 AddLZ77Block(2, final, lz77, lstart, lend,
-                             expected_data_size, bp, OutFilePart);
+                             expected_data_size, ref bp, OutFilePart);
             }
 
         }
@@ -2019,7 +2008,7 @@ namespace ZopfliCSharp
         static void AddNonCompressedBlock(bool final,
                                   byte[] InFile, int instart,
                                   int inend,
-                                  byte[] bp,
+                                  ref int bp,
                                   OutputSink OutFilePart)
         {
             int pos = instart;
@@ -2035,13 +2024,13 @@ namespace ZopfliCSharp
 
                 nlen = (ushort)~blocksize;
 
-                AddBit(Convert.ToInt32(final && currentfinal), bp, OutFilePart);
+                AddBit(Convert.ToInt32(final && currentfinal), ref bp, OutFilePart);
                 /* BTYPE 00 */
-                AddBit(0, bp, OutFilePart);
-                AddBit(0, bp, OutFilePart);
+                AddBit(0, ref bp, OutFilePart);
+                AddBit(0, ref bp, OutFilePart);
 
                 /* Any bits of input up to the next byte boundary are ignored. */
-                bp[0] = 0;
+                bp = 0;
 
                 OutFilePart.Add((byte)(blocksize % 256));
                 OutFilePart.Add((byte)((blocksize / 256) % 256));
@@ -2067,7 +2056,7 @@ namespace ZopfliCSharp
         This function will usually output multiple deflate blocks. If final is 1, then
         the final bit will be set on the last block.
         */
-        static void ZopfliDeflatePart(int btype, bool final, byte[] InFile, int instart, int inend , byte[] bp, OutputSink OutFilePart)
+        static void ZopfliDeflatePart(int btype, bool final, byte[] InFile, int instart, int inend , ref int bp, OutputSink OutFilePart)
         {
             int i;
             /* byte coordinates rather than lz77 index */
@@ -2082,7 +2071,7 @@ namespace ZopfliCSharp
             block splitting as they have no dynamic huffman trees. */
             if (btype == 0)
             {
-                AddNonCompressedBlock(final, InFile, instart, inend, bp, OutFilePart);
+                AddNonCompressedBlock(final, InFile, instart, inend, ref bp, OutFilePart);
                 return;
             }
             else if (btype == 1)
@@ -2092,7 +2081,7 @@ namespace ZopfliCSharp
 
                 ZopfliLZ77OptimalFixed(s, store.data, (ulong)instart, (ulong)inend, store);
                 AddLZ77Block( btype, final, store, 0, store.size, 0,
-                             bp, OutFilePart);
+                             ref bp, OutFilePart);
 
                 return;
             }
@@ -2145,7 +2134,7 @@ namespace ZopfliCSharp
                 ulong start = i == 0 ? 0 : splitpoints[i - 1];
                 ulong end = i == (int)npoints ? lz77.size : splitpoints[i];
                 AddLZ77BlockAutoType(i == (int)npoints && final == true,
-                                     lz77, start, end, 0, bp, OutFilePart);
+                                     lz77, start, end, 0, ref bp, OutFilePart);
             }
 
         }

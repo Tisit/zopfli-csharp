@@ -34,9 +34,8 @@ namespace ZopfliCSharp
 
         static void ClearStatFreqs(SymbolStats stats)
         {
-            ulong i;
-            for (i = 0; i < ZOPFLI_NUM_LL; i++) stats.litlens[i] = 0;
-            for (i = 0; i < ZOPFLI_NUM_D; i++) stats.dists[i] = 0;
+            Array.Clear(stats.litlens);
+            Array.Clear(stats.dists);
         }
 
         /* Get random number: "Multiply-With-Carry" generator of G. Marsaglia */
@@ -170,11 +169,6 @@ namespace ZopfliCSharp
             return GetCostStat(bestlength, bestdist, stats);
         }
 
-        static ulong zopfli_min(ulong a, ulong b)
-        {
-            return a < b ? a : b;
-        }
-
         /*
         Performs the forward pass for "squeeze". Gets the most optimal length to reach
         every byte from a previous byte, using cost calculations.
@@ -300,7 +294,7 @@ namespace ZopfliCSharp
                     }
                 }
                 /* Lengths. */
-                kend = zopfli_min(leng, (ulong)inend - i);
+                kend = Math.Min(leng, (ulong)inend - i);
                 mincostaddcostj = mincost + costs[j];
                 for (k = 3; k <= kend; k++)
                 {
