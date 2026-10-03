@@ -33,15 +33,13 @@ namespace ZopfliCSharp
         static public int blocksplittingmax = 15;
 
         static public bool output_to_stdout = false;
-        static public string filename = "";
-        static public string outfilename;
         static public ZopfliFormat output_type = ZopfliFormat.ZOPFLI_FORMAT_GZIP;
     }
     
     static class Program
     {
 
-        static void CompressFile()
+        static void CompressFile(string infilename, string outfilename)
         {
             /* Stream both input and output so the whole file and the whole compressed
                result are never held in memory at once. File I/O errors (missing file,
@@ -49,16 +47,16 @@ namespace ZopfliCSharp
                surfacing as an unhandled exception with a stack trace. */
             try
             {
-                using FileStream inStream = new FileStream(Globals.filename, FileMode.Open,
+                using FileStream inStream = new FileStream(infilename, FileMode.Open,
                     FileAccess.Read, FileShare.Read, 1 << 16);
 
                 if (inStream.Length > 2147483647)
                 {
-                    Console.WriteLine("Files larger than 2GB are not supported.");
-                    Environment.Exit(1);
+                    Console.Error.WriteLine("Files larger than 2GB are not supported: " + infilename);
+                    return;
                 }
 
-                if (Globals.outfilename == "")
+                if (outfilename == "")
                 {
                     /* Streaming to stdout: there is no file to make atomic. */
                     using Stream stdout = Console.OpenStandardOutput();
@@ -74,7 +72,7 @@ namespace ZopfliCSharp
                    temp is removed on any failure. This uses only portable BCL APIs, so
                    it behaves the same on Windows (FlushFileBuffers + MoveFileEx) and
                    Linux (fsync + rename). */
-                string finalPath = Globals.outfilename;
+                string finalPath = outfilename;
                 string tempPath = finalPath + ".tmp" + Environment.ProcessId;
 
                 ConsoleCancelEventHandler onCancel = (s, e) => TryDelete(tempPath);
@@ -105,10 +103,13 @@ namespace ZopfliCSharp
                     Console.CancelKeyPress -= onCancel;
                 }
             }
+            catch (FileNotFoundException)
+            {
+                Console.Error.WriteLine("Invalid filename: " + infilename);
+            }
             catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
             {
-                Console.WriteLine("Error: " + ex.Message);
-                Environment.Exit(1);
+                Console.Error.WriteLine("Error: " + ex.Message);
             }
         }
 
@@ -153,7 +154,7 @@ namespace ZopfliCSharp
                                           "  -v    verbose mode\n" +
                                           "  --i#  perform # iterations (default 15). More gives" +
                                           " more compression but is slower." +
-                                          " Examples: --i10, --i50, --i1000\n!" +
+                                          " Examples: --i10, --i50, --i1000\n" +
                                           "  --gzip        output to gzip format (default)\n" +
                                           "  --zlib        output to zlib format instead of gzip\n" + 
                                           "  --deflate     output to deflate format instead of gzip\n" +
@@ -171,40 +172,12 @@ namespace ZopfliCSharp
                         }
                         else if (arg.Length > 0 && arg[0] != '-')
                         {
-                            Globals.filename = arg;
-                            if (Globals.output_to_stdout)
-                            {
-                                Globals.outfilename = "";
-                            }
-                            else if (Globals.output_type == ZopfliFormat.ZOPFLI_FORMAT_GZIP)
-                            {
-                                Globals.outfilename = Globals.filename + ".gz";
-                            }
-                            else if (Globals.output_type == ZopfliFormat.ZOPFLI_FORMAT_ZLIB)
-                            {
-                                Globals.outfilename = Globals.filename + ".zlib";
-                            }
-                            else
-                            {
-                                Debug.Assert(Globals.output_type == ZopfliFormat.ZOPFLI_FORMAT_DEFLATE);
-                                Globals.outfilename = Globals.filename + ".deflate";
-                            }
-                            if (Globals.verbose == 1 && Globals.outfilename != "")
-                            {
-                                Console.WriteLine("Saving to: " + Globals.outfilename);
-                            }
+                            /* file name: handled in the second pass, once all options are known */
                         }
                         else
                             Console.WriteLine("Unknown parameter!");
                         break;
                 }
-            }
-
-            if (Globals.filename == "" || Globals.filename is null)
-            {
-                string AppName = System.Diagnostics.Process.GetCurrentProcess().ProcessName;
-                Console.WriteLine("Please provide filename\nFor help, type: " + AppName + " -h");
-                return 0;
             }
 
             if (Globals.numiterations < 1)
@@ -213,7 +186,45 @@ namespace ZopfliCSharp
                 return 0;
             }
 
-            CompressFile();
+            /* Like the original, options apply to every file regardless of where they
+               appear on the command line; each file is then compressed in turn. */
+            bool anyFile = false;
+            foreach (string arg in args)
+            {
+                if (arg.Length == 0 || arg[0] == '-')
+                    continue;
+                anyFile = true;
+
+                string outfilename;
+                if (Globals.output_to_stdout)
+                {
+                    outfilename = "";
+                }
+                else if (Globals.output_type == ZopfliFormat.ZOPFLI_FORMAT_GZIP)
+                {
+                    outfilename = arg + ".gz";
+                }
+                else if (Globals.output_type == ZopfliFormat.ZOPFLI_FORMAT_ZLIB)
+                {
+                    outfilename = arg + ".zlib";
+                }
+                else
+                {
+                    Debug.Assert(Globals.output_type == ZopfliFormat.ZOPFLI_FORMAT_DEFLATE);
+                    outfilename = arg + ".deflate";
+                }
+                if (Globals.verbose == 1 && outfilename != "")
+                {
+                    Console.Error.WriteLine("Saving to: " + outfilename);
+                }
+                CompressFile(arg, outfilename);
+            }
+
+            if (!anyFile)
+            {
+                string AppName = System.Diagnostics.Process.GetCurrentProcess().ProcessName;
+                Console.Error.WriteLine("Please provide filename\nFor help, type: " + AppName + " -h");
+            }
 
             return 0;
         }
