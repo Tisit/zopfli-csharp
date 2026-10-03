@@ -8,8 +8,10 @@
 
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
     <Optimize>true</Optimize>
-    <TieredCompilation>true</TieredCompilation>
-    <TieredPGO>true</TieredPGO>
+    <!-- Compile every method fully optimized up front. The hot loops run for seconds
+         inside a few long calls, so with tiering they mostly execute as on-stack
+         replacement code with synthesized profile data, which measured ~8% slower. -->
+    <TieredCompilation>false</TieredCompilation>
     <ServerGarbageCollection>true</ServerGarbageCollection>
     <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
   </PropertyGroup>

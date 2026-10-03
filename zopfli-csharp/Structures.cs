@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using ZopfliCSharp;
 
@@ -151,11 +152,26 @@ class ZopfliLZ77Store
     }
 }
 
+/*
+A longest match for some position in run-length form: for each length in
+(end[r - 1], end[r]] (starting at ZOPFLI_MIN_MATCH for r = 0), dist[r] is the
+smallest distance that reaches that length. This replaces the per-length "sublen"
+array of the C original. The match finder visits candidates in order of increasing
+distance, so each time it finds a longer match that starts a new run, and runs are
+never adjacent with equal distances.
+*/
+class MatchRuns
+{
+    public readonly int[] end = new int[Compress.ZOPFLI_MAX_MATCH + 1];
+    public readonly ushort[] dist = new ushort[Compress.ZOPFLI_MAX_MATCH + 1];
+    public int count;
+}
+
 class ZopfliLongestMatchCache
 {
     public ushort[] length;
     public ushort[] dist;
-    public byte[] sublen;
+    public byte[] runs;  /* Per position, the runs of the match (see ZopfliRunsToCache). */
 }
 class ZopfliBlockState
 {
@@ -192,7 +208,7 @@ class ZopfliBlockState
                 lmc.length[i] = 1;
             }
             lmc.dist = new ushort[blocksize];
-            lmc.sublen = new byte[ZOPFLI_CACHE_LENGTH * 3 * blocksize];
+            lmc.runs = new byte[ZOPFLI_CACHE_LENGTH * 3 * blocksize];
         }
         else
         {
@@ -200,73 +216,113 @@ class ZopfliBlockState
         }
     }
 
-    public void ZopfliSublenToCache(ushort[] sublen, int pos, int length)
+    /*
+    Stores the runs of a longest match found for pos, whose length is length, in the
+    cache. Holds the first ZOPFLI_CACHE_LENGTH runs as (last length - 3, distance)
+    triples; if there are fewer, the last slot's length records the longest cached
+    length.
+    */
+    public void ZopfliRunsToCache(MatchRuns runs, int pos, int length)
     {
-        int i;
-        int j = 0;
-        uint bestlength = 0;
-        
+        byte[] cs = lmc.runs;
+        int cachebase = ZOPFLI_CACHE_LENGTH * pos * 3;
+
         if (length < 3) return;
-        for (i = 3; i <= length; i++)
+        int n = Math.Min(runs.count, ZOPFLI_CACHE_LENGTH);
+        for (int j = 0; j < n; j++)
         {
-            if (i == length || sublen[i] != sublen[i + 1])
-            {
-                lmc.sublen[ZOPFLI_CACHE_LENGTH * pos * 3 + j * 3] = (byte)(i - 3);
-                lmc.sublen[ZOPFLI_CACHE_LENGTH * pos * 3 + j * 3 + 1] = (byte)(sublen[i] % 256);
-                lmc.sublen[ZOPFLI_CACHE_LENGTH * pos * 3 + j * 3 + 2] = (byte)((sublen[i] >> 8) % 256);
-                bestlength = (uint)i;
-                j++;
-                if (j >= ZOPFLI_CACHE_LENGTH) break;
-            }
+            int end = runs.end[j];
+            ushort dist = runs.dist[j];
+            cs[cachebase + j * 3] = (byte)(end - 3);
+            cs[cachebase + j * 3 + 1] = (byte)(dist % 256);
+            cs[cachebase + j * 3 + 2] = (byte)((dist >> 8) % 256);
         }
-        if (j < ZOPFLI_CACHE_LENGTH)
+        if (n < ZOPFLI_CACHE_LENGTH)
         {
-            Debug.Assert(bestlength == length);
-            lmc.sublen[ZOPFLI_CACHE_LENGTH * pos * 3 + (ZOPFLI_CACHE_LENGTH - 1) * 3] = (byte)(bestlength - 3);
+            Debug.Assert(runs.end[n - 1] == length);
+            cs[cachebase + (ZOPFLI_CACHE_LENGTH - 1) * 3] = (byte)(length - 3);
         }
-        else
-        {
-            Debug.Assert(bestlength <= length);
-        }
-        Debug.Assert(bestlength == ZopfliMaxCachedSublen((ulong)pos));
-        
+        Debug.Assert(runs.end[n - 1] <= length);
+        Debug.Assert(runs.end[n - 1] == ZopfliMaxCachedLength(pos));
     }
 
-    public void ZopfliCacheToSublen(
-                         ulong pos, ulong length,
-                         ushort[] sublen)
+    /*
+    Loads the cached runs for pos into runs (see ZopfliRunsToCache). Only valid when
+    runs are cached for pos, i.e. ZopfliMaxCachedLength(pos) > 0.
+    */
+    public void ZopfliCacheToRuns(int pos, MatchRuns runs)
     {
-        if (length < 3) return;
-        uint maxlength = ZopfliMaxCachedSublen(pos);
-        /* Hoist the per-position base index and array reference out of the loop,
-           and fill each length-range with a vectorized Array.Fill instead of a
-           scalar ulong-indexed loop. This method is ~13% of total runtime. */
-        int cachebase = (int)(ZOPFLI_CACHE_LENGTH * pos * 3);
-        byte[] cs = lmc.sublen;
-        int prevlength = 0;
+        int maxlength = ZopfliMaxCachedLength(pos);
+        int cachebase = ZOPFLI_CACHE_LENGTH * pos * 3;
+        byte[] cs = lmc.runs;
+        int n = 0;
         for (int j = 0; j < ZOPFLI_CACHE_LENGTH; j++)
         {
             int o = cachebase + j * 3;
             int length2 = cs[o] + 3;
-            ushort dist = (ushort)(cs[o + 1] + 256 * cs[o + 2]);
-            int count = length2 - prevlength + 1;
-            if (count > 0) Array.Fill(sublen, dist, prevlength, count);
+            runs.end[n] = length2;
+            runs.dist[n] = (ushort)(cs[o + 1] + 256 * cs[o + 2]);
+            n++;
             if (length2 == maxlength) break;
-            prevlength = length2 + 1;
         }
+        runs.count = n;
+    }
+
+    /*
+    The longest match cache lookup of the optimal parser's hot loop (limit ==
+    ZOPFLI_MAX_MATCH, runs wanted), with ZopfliMaxCachedLength and ZopfliCacheToRuns
+    folded in. Hits exactly when Compress.TryGetFromLongestMatchCache would. Returns
+    whether it hit; if so, sets length and runs.
+    The duplicated decoding is deliberate: sharing one helper with ZopfliCacheToRuns
+    (inlined or not) measured ~1.7% slower overall.
+    */
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryGetCachedRuns(int pos, MatchRuns runs, ref ushort length)
+    {
+        ushort[] lmcLength = lmc.length;
+        if (lmcLength == null) return false;  /* No cache (add_lmc == 0). */
+
+        int lmcpos = pos - blockstart;
+        ushort cachedLen = lmcLength[lmcpos];
+        /* Length > 0 and dist 0 is invalid combination, which indicates on purpose
+           that this cache value is not filled in yet. */
+        if (cachedLen != 0 && lmc.dist[lmcpos] == 0) return false;
+
+        /* One bounds check for the position's whole cache entry. */
+        ReadOnlySpan<byte> entry = lmc.runs.AsSpan(ZOPFLI_CACHE_LENGTH * 3 * lmcpos,
+                                                     ZOPFLI_CACHE_LENGTH * 3);
+        int maxlength = entry[1] == 0 && entry[2] == 0
+            ? 0 : entry[(ZOPFLI_CACHE_LENGTH - 1) * 3] + 3;
+        if (cachedLen > maxlength) return false;
+
+        length = cachedLen;
+        int n = 0;
+        if (cachedLen >= 3)
+        {
+            int[] end = runs.end;
+            ushort[] dist = runs.dist;
+            for (int j = 0; j < ZOPFLI_CACHE_LENGTH; j++)
+            {
+                int length2 = entry[j * 3] + 3;
+                end[n] = length2;
+                dist[n] = (ushort)(entry[j * 3 + 1] + 256 * entry[j * 3 + 2]);
+                n++;
+                if (length2 == maxlength) break;
+            }
+        }
+        runs.count = n;
+        return true;
     }
 
     /*
     Returns the length up to which could be stored in the cache.
     */
-    public uint ZopfliMaxCachedSublen(ulong pos)
+    public int ZopfliMaxCachedLength(int pos)
     {
-        /* Hoist the per-position base index (int) and the array reference; this runs on
-           the hot cache path and a ulong index / repeated field deref costs here. */
-        byte[] cs = lmc.sublen;
-        int cachebase = (int)(ZOPFLI_CACHE_LENGTH * pos * 3);
-        if (cs[cachebase + 1] == 0 && cs[cachebase + 2] == 0) return 0;  /* No sublen cached. */
-        return (uint)(cs[cachebase + (ZOPFLI_CACHE_LENGTH - 1) * 3] + 3);
+        byte[] cs = lmc.runs;
+        int cachebase = ZOPFLI_CACHE_LENGTH * pos * 3;
+        if (cs[cachebase + 1] == 0 && cs[cachebase + 2] == 0) return 0;  /* No runs cached. */
+        return cs[cachebase + (ZOPFLI_CACHE_LENGTH - 1) * 3] + 3;
     }
 }
 
@@ -284,14 +340,17 @@ speed.
     public const int ZOPFLI_WINDOW_MASK = ZOPFLI_WINDOW_SIZE - 1;
     const int ZOPFLI_MIN_MATCH = 3;
 
-    public int[] head;  /* Hash value to index of its most recent occurrence. */
+    /* Hash values are masked to 15 bits (HASH_MASK), and positions to the window, so
+       the head tables need only HASH_MASK + 1 short entries (64 KB each), which keeps
+       both within the L2 cache. */
+    public short[] head;  /* Hash value to index of its most recent occurrence. */
     public short[] prev;  /* Index to index of prev. occurrence of same hash. */
     public short[] hashval;  /* Index to hash value at this index. */
     public int val;  /* Current hash value. */
 
     /* Fields with similar purpose as the above hash, but for the second hash with
     a value that is calculated differently.  */
-    public int[] head2;  /* Hash value to index of its most recent occurrence. */
+    public short[] head2;  /* Hash value to index of its most recent occurrence. */
     public short[] prev2;  /* Index to index of prev. occurrence of same hash. */
     public short[] hashval2;  /* Index to hash value at this index. */
     public int val2;  /* Current hash value. */
@@ -300,13 +359,13 @@ speed.
 
     public ZopfliHash()
     {
-        head = new int[65536];
+        head = new short[HASH_MASK + 1];
         prev = new short[ZOPFLI_WINDOW_SIZE];
         hashval = new short[ZOPFLI_WINDOW_SIZE];
 
         same = new ushort[ZOPFLI_WINDOW_SIZE];
 
-        head2 = new int[65536];
+        head2 = new short[HASH_MASK + 1];
         prev2 = new short[ZOPFLI_WINDOW_SIZE];
         hashval2 = new short[ZOPFLI_WINDOW_SIZE];
     }
@@ -315,7 +374,7 @@ speed.
     {
         int i;
 
-        Array.Fill(head, -1 /* -1 indicates no head so far. */);
+        Array.Fill<short>(head, -1 /* -1 indicates no head so far. */);
 
         for (i = 0; i < ZOPFLI_WINDOW_SIZE; i++)
         {
@@ -328,7 +387,7 @@ speed.
 
         val = 0;
         val2 = 0;
-        Array.Fill(head2, -1 /* -1 indicates no head so far. */);
+        Array.Fill<short>(head2, -1 /* -1 indicates no head so far. */);
         Array.Fill<short>(hashval2, -1 /* -1 indicates no head so far. */);
     }
     /*
@@ -343,7 +402,7 @@ speed.
 
     public void ZopfliUpdateHash(byte[] array, int pos, int end)
     {
-        short hpos = (short)(pos & ZOPFLI_WINDOW_MASK);
+        int hpos = pos & ZOPFLI_WINDOW_MASK;
         int amount = 0;
 
         byte t;
@@ -353,40 +412,87 @@ speed.
         } else
             t = 0;
         UpdateHashValue(t);
-        hashval[hpos] = (short)val;
-        if (head[val] != -1 && hashval[head[val]] == val)
-        {
-            prev[hpos] = (short)head[val];
-            Debug.Assert(head[val] <= short.MaxValue);
-        }
-        else prev[hpos] = hpos;
-        head[val] = hpos;
+        int v = val;
+        hashval[hpos] = (short)v;
+        int h = head[v];
+        prev[hpos] = (short)(h != -1 && hashval[h] == v ? h : hpos);
+        head[v] = (short)hpos;
 
         /* Update "same". */
-        if (same[(pos - 1) & ZOPFLI_WINDOW_MASK] > 1)
+        int prevsame = same[(pos - 1) & ZOPFLI_WINDOW_MASK];
+        if (prevsame > 1)
         {
-            amount = same[(pos - 1) & ZOPFLI_WINDOW_MASK] - 1;
+            amount = prevsame - 1;
         }
         while (pos + amount + 1 < end && array[pos] == array[pos + amount + 1] && amount < ushort.MaxValue) {
             amount++;
         }
         same[hpos] = (ushort)amount;
 
-        val2 = ((same[hpos] - ZOPFLI_MIN_MATCH) & 255) ^ val;
-        hashval2[hpos] = (short)val2;
-        if (head2[val2] != -1 && hashval2[head2[val2]] == val2)
-        {
-            prev2[hpos] = (short)head2[val2];
-            Debug.Assert(head[val2] <= short.MaxValue);
-
-        }
-        else prev2[hpos] = hpos;
-        head2[val2] = hpos;
+        int v2 = ((amount - ZOPFLI_MIN_MATCH) & 255) ^ v;
+        val2 = v2;
+        hashval2[hpos] = (short)v2;
+        int h2 = head2[v2];
+        prev2[hpos] = (short)(h2 != -1 && hashval2[h2] == v2 ? h2 : hpos);
+        head2[v2] = (short)hpos;
     }
     public void ZopfliWarmupHash(byte[] InFile, int pos, int end)
     {
         UpdateHashValue(InFile[pos + 0]);
         if (pos + 1 < end) UpdateHashValue(InFile[pos + 1]);
+    }
+}
+
+/*
+The chains of a ZopfliHash, precomputed for every position of a range. The rolling
+hash is deterministic, so for a given range the chains seen at a position are the
+same in every pass over it, and the optimal parser makes two passes per iteration
+(~30 per block). Building the hash once and recording, per position, everything the
+longest match search reads from it replaces all that hash maintenance with lookups.
+The arrays are indexed by (absolute position - start), where start is the window
+start of the range, i.e. where the hash would have been reset and warmed up.
+*/
+class ZopfliHashChains
+{
+    public readonly int start;
+
+    /* Distance back to the previous position in this position's chain of the first
+       hash, or 0 if it is the end of its chain (ZopfliHash's prev[i] == i). */
+    public readonly ushort[] step;
+    /* Same, for the second hash. */
+    public readonly ushort[] step2;
+    /* Amount of repetitions of same byte after this. */
+    public readonly ushort[] same;
+    /* Value of the second hash at this position. */
+    public readonly ushort[] val2;
+
+    /* Runs ZopfliHash over [instart - window, inend) exactly as a pass that searches
+       matches in [instart, inend) would. */
+    public ZopfliHashChains(byte[] array, int instart, int inend)
+    {
+        const int mask = ZopfliHash.ZOPFLI_WINDOW_MASK;
+        start = instart > ZopfliHash.ZOPFLI_WINDOW_SIZE
+            ? instart - ZopfliHash.ZOPFLI_WINDOW_SIZE : 0;
+        int n = Math.Max(inend - start, 0);
+        step = new ushort[n];
+        step2 = new ushort[n];
+        same = new ushort[n];
+        val2 = new ushort[n];
+        if (instart >= inend) return;
+
+        ZopfliHash h = new ZopfliHash();
+        h.ZopfliResetHash();
+        h.ZopfliWarmupHash(array, start, inend);
+        for (int i = start; i < inend; i++)
+        {
+            h.ZopfliUpdateHash(array, i, inend);
+            int hpos = i & mask;
+            int k = i - start;
+            step[k] = (ushort)((hpos - h.prev[hpos]) & mask);
+            step2[k] = (ushort)((hpos - h.prev2[hpos]) & mask);
+            same[k] = h.same[hpos];
+            val2[k] = (ushort)h.val2;
+        }
     }
 }
 

@@ -1,8 +1,11 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using zopfli_csharp;
 
 namespace ZopfliCSharp
@@ -189,16 +192,13 @@ namespace ZopfliCSharp
                              int instart, int inend,
                              SymbolStats stats,
                              ushort[] length_array,
-                             ZopfliHash h, float[] costs, bool fixedcosts)
+                             ZopfliHashChains chains, float[] costs, bool fixedcosts)
         {
             /* Best cost to get here so far. */
             ulong blocksize = (ulong)(inend - instart);
             ulong i, k, kend;
             ushort leng = 0; //bogus value
             ushort dist = 0; //bogusvalue
-            ushort[] sublen = new ushort[259];
-            ulong windowstart = (ulong)(instart > ZopfliHash.ZOPFLI_WINDOW_SIZE
-                ? instart - ZopfliHash.ZOPFLI_WINDOW_SIZE : 0);
             double result;
             double mincost = GetCostModelMinCost(stats, fixedcosts);
             double mincostaddcostj;
@@ -219,6 +219,12 @@ namespace ZopfliCSharp
                     ? lbits + (lsym <= 279 ? 7 : 8)
                     : lbits + stats.ll_symbols[lsym];
             }
+            /* Single-precision copy of costLen for the pre-filter in UpdateCostsForRun. */
+            float[] costLenF = new float[ZOPFLI_MAX_MATCH + 1];
+            for (int len = 0; len <= ZOPFLI_MAX_MATCH; len++)
+            {
+                costLenF[len] = (float)costLen[len];
+            }
             for (int d = 1; d <= ZopfliHash.ZOPFLI_WINDOW_SIZE; d++)
             {
                 int dbits = Symbols.ZopfliGetDistExtraBits(d);
@@ -227,44 +233,42 @@ namespace ZopfliCSharp
                     : dbits + stats.d_symbols[Symbols.ZopfliGetDistSymbol((ushort)d)];
             }
 
-            h.ZopfliResetHash();
-            h.ZopfliWarmupHash(InFile, (int)windowstart, inend);
-            for (i = windowstart; i < (ulong)instart; i++)
-            {
-                h.ZopfliUpdateHash(InFile, (int)i, inend);
-            }
+            ushort[] same = chains.same;
+            int cstart = chains.start;
 
             Array.Fill(costs, (float)Compress.ZOPFLI_LARGE_FLOAT);
             costs[0] = 0;  /* Because it's the start. */
             length_array[0] = 0;
 
-            /* Element-0 refs for the inner length loop. Every index there is provably
-               in range under the loop invariants (jk <= blocksize < costs/length_array
-               length; k <= ZOPFLI_MAX_MATCH < costLen/sublen length; sublen[k] is a
-               distance <= ZOPFLI_WINDOW_SIZE < costDist length), but the JIT can't prove
-               it (kend is a runtime min), so it emits a bounds check per access in this,
-               the hottest loop in the program. Indexing through these refs elides them;
-               the Debug.Asserts below enforce each invariant in Debug builds (compiled
-               out in Release, same pattern as GetMatch). These arrays are never
-               reallocated, and managed byrefs are GC-tracked, so hoisting is safe. */
+            /* Element-0 refs for the inner length loop (UpdateCostsForRun). Every index
+               there is provably in range under the loop invariants (j + k <= j + kend <=
+               blocksize < costs/length_array length; k <= ZOPFLI_MAX_MATCH < costLen
+               length), but the JIT can't prove it (kend is a runtime min), so it would
+               emit a bounds check per access in this, the hottest loop in the program.
+               Indexing through these refs elides them; the Debug.Asserts enforce each
+               invariant in Debug builds (compiled out in Release, same pattern as
+               GetMatch). These arrays are never reallocated, and managed byrefs are
+               GC-tracked, so hoisting is safe. */
             ref float costs0 = ref MemoryMarshal.GetArrayDataReference(costs);
             ref ushort la0 = ref MemoryMarshal.GetArrayDataReference(length_array);
             ref double costLen0 = ref MemoryMarshal.GetArrayDataReference(costLen);
-            ref double costDist0 = ref MemoryMarshal.GetArrayDataReference(costDist);
-            ref ushort sublen0 = ref MemoryMarshal.GetArrayDataReference(sublen);
+            ref float costLenF0 = ref MemoryMarshal.GetArrayDataReference(costLenF);
+
+            /* The current match as runs of equal distance. */
+            MatchRuns runs = new MatchRuns();
+            int[] runEnd = runs.end;
+            ushort[] runDist = runs.dist;
 
             for (i = (ulong)instart; i < (ulong)inend; i++)
             {
                 ulong j = i - (ulong)instart;  /* Index in the costs array and length_array. */
-                h.ZopfliUpdateHash(InFile, (int)i, inend);
 
                 /* If we're in a long repetition of the same character and have more than
                 ZOPFLI_MAX_MATCH characters before and after our position. */
-                if (h.same[i & ZopfliHash.ZOPFLI_WINDOW_MASK] > ZOPFLI_MAX_MATCH * 2
+                if (same[(int)i - cstart] > ZOPFLI_MAX_MATCH * 2
                     && (int)i > instart + ZOPFLI_MAX_MATCH + 1
                     && i + ZOPFLI_MAX_MATCH * 2 + 1 < (ulong)inend
-                    && h.same[(i - ZOPFLI_MAX_MATCH) & ZopfliHash.ZOPFLI_WINDOW_MASK]
-                        > ZOPFLI_MAX_MATCH)
+                    && same[(int)i - ZOPFLI_MAX_MATCH - cstart] > ZOPFLI_MAX_MATCH)
                 {
                     double symbolcost;
 
@@ -284,12 +288,18 @@ namespace ZopfliCSharp
                         length_array[j + ZOPFLI_MAX_MATCH] = ZOPFLI_MAX_MATCH;
                         i++;
                         j++;
-                        h.ZopfliUpdateHash(InFile, (int)i, inend);
                     }
                 }
 
-                ZopfliFindLongestMatch(s, h, InFile, (int)i, inend, ZOPFLI_MAX_MATCH, sublen,
-                                        ref dist,  ref leng);
+                /* Get the match as runs of equal distance: straight from the longest
+                   match cache when possible (the common case after the first pass),
+                   otherwise by searching. */
+                if (!s.TryGetCachedRuns((int)i, runs, ref leng))
+                {
+                    ZopfliFindLongestMatch(s, chains, InFile, (int)i, inend, ZOPFLI_MAX_MATCH, runs,
+                                            ref dist, ref leng);
+                }
+                int nruns = runs.count;
 
                 /* Literal. */
                 if (i + 1 <= (ulong)inend)
@@ -314,30 +324,18 @@ namespace ZopfliCSharp
                 kend = Math.Min(leng, (ulong)inend - i);
                 float costsj = costs[j];  /* Loop-invariant; also feeds each newCost. */
                 mincostaddcostj = mincost + costsj;
-                int jk = (int)j + 3;  /* Running index for costs[j+k]/length_array[j+k]. */
-                for (k = 3; k <= kend; k++, jk++)
+                /* Within a run the distance, and so its cost, is constant, which lets
+                   the per-length update be vectorized. */
+                Debug.Assert((int)j + (int)kend < costs.Length);
+                int lo = ZOPFLI_MIN_MATCH;
+                for (int r = 0; r < nruns && lo <= (int)kend; r++)
                 {
-                    /* Read costs[j+k] once (it's used by both the early-out and the
-                    comparison below). */
-                    Debug.Assert(jk >= 0 && jk < costs.Length);
-                    float cur = Unsafe.Add(ref costs0, jk);
-
-                    /* Calling the cost model is expensive, avoid this if we are already at
-                    the minimum possible cost that it can return. */
-                    if (cur <= mincostaddcostj) continue;
-
-                    Debug.Assert(k <= ZOPFLI_MAX_MATCH);
-                    ushort sl = Unsafe.Add(ref sublen0, (nint)k);
-                    Debug.Assert(sl <= ZopfliHash.ZOPFLI_WINDOW_SIZE);
-                    double newCost = Unsafe.Add(ref costLen0, (nint)k)
-                                   + Unsafe.Add(ref costDist0, (nint)sl) + costsj;
-                    Debug.Assert(newCost >= 0);
-                    if (newCost < cur)
-                    {
-                        Debug.Assert(jk < length_array.Length);
-                        Unsafe.Add(ref costs0, jk) = (float)newCost;
-                        Unsafe.Add(ref la0, jk) = (ushort)k;
-                    }
+                    int hi = Math.Min(runEnd[r], (int)kend);
+                    Debug.Assert(runDist[r] <= ZopfliHash.ZOPFLI_WINDOW_SIZE);
+                    UpdateCostsForRun(ref Unsafe.Add(ref costs0, (nint)j),
+                                      ref Unsafe.Add(ref la0, (nint)j), ref costLen0, ref costLenF0,
+                                      lo, hi, costDist[runDist[r]], costsj, mincostaddcostj);
+                    lo = runEnd[r] + 1;
                 }
             }
 
@@ -345,6 +343,109 @@ namespace ZopfliCSharp
             result = costs[blocksize];
 
             return result;
+        }
+
+        /*
+        Relaxes costs[k] / length_array[k] for every match length k in [lo, hi] that
+        uses the same distance, whose cost is costDist. costs and lengths point at
+        element j (the current position), so index k means position j + k.
+        Bit-identical to the scalar form: every update is decided and computed by the
+        exact double-precision code (Relax4 or the tail loop); the vector pre-filter
+        only skips groups of lengths that provably cannot pass that test.
+        */
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static void UpdateCostsForRun(ref float costs, ref ushort lengths, ref double costLen,
+                                      ref float costLenF, int lo, int hi, double costDist,
+                                      float costsj, double mincostaddcostj)
+        {
+            Debug.Assert(lo >= ZOPFLI_MIN_MATCH && hi <= ZOPFLI_MAX_MATCH);
+            int k = lo;
+            if (Avx.IsSupported)
+            {
+                Vector256<double> vDist = Vector256.Create(costDist);
+                Vector256<double> vCostj = Vector256.Create((double)costsj);
+                Vector256<double> vMin = Vector256.Create(mincostaddcostj);
+
+                /* Pre-filter, 8 lengths at a time in single precision. With L = costLen[k],
+                   D = costDist and S = costsj (all >= 0), the exact test takes a length
+                   only if fl64(fl64(L + D) + S) < cur, so L + D + S < cur * (1 + 2^-51).
+                   The estimate est = fl32(fl32(L) + fl32(fl32(D) + S)) has 4 roundings
+                   of relative error u = 2^-24 each, so est <= (L + D + S) * (1 + u)^3
+                   < cur * (1 + 3.01u) for every length the exact test would take. The
+                   threshold fl32(fl32(cur * (1 + 8u)) + 1e-30) is at least
+                   cur * (1 + 7u - 8u^2) (the 1e-30 absorbs subnormal rounding, which
+                   is absolute rather than relative), so no such length is filtered out.
+                   Groups where no lane passes (the vast majority) are skipped. */
+                Vector256<float> vC2 = Vector256.Create((float)costDist + costsj);
+                Vector256<float> vScale = Vector256.Create(1f + 1f / (1 << 21));
+                Vector256<float> vTiny = Vector256.Create(1e-30f);
+                for (; k + 7 <= hi; k += 8)
+                {
+                    Vector256<float> cur = Vector256.LoadUnsafe(ref costs, (nuint)k);
+                    Vector256<float> est = Avx.Add(Vector256.LoadUnsafe(ref costLenF, (nuint)k), vC2);
+                    Vector256<float> threshold = Avx.Add(Avx.Multiply(cur, vScale), vTiny);
+                    int maybe = Avx.MoveMask(Avx.CompareLessThanOrEqual(est, threshold));
+                    if (maybe == 0) continue;
+                    if ((maybe & 0x0F) != 0)
+                        Relax4(ref costs, ref lengths, ref costLen, k, vDist, vCostj, vMin);
+                    if ((maybe & 0xF0) != 0)
+                        Relax4(ref costs, ref lengths, ref costLen, k + 4, vDist, vCostj, vMin);
+                }
+                for (; k + 3 <= hi; k += 4)
+                {
+                    Relax4(ref costs, ref lengths, ref costLen, k, vDist, vCostj, vMin);
+                }
+            }
+            for (; k <= hi; k++)
+            {
+                float cur = Unsafe.Add(ref costs, k);
+                /* Calling the cost model is expensive, avoid this if we are already at
+                the minimum possible cost that it can return. */
+                if (cur <= mincostaddcostj) continue;
+                double newCost = Unsafe.Add(ref costLen, k) + costDist + costsj;
+                Debug.Assert(newCost >= 0);
+                if (newCost < cur)
+                {
+                    Unsafe.Add(ref costs, k) = (float)newCost;
+                    Unsafe.Add(ref lengths, k) = (ushort)k;
+                }
+            }
+        }
+
+        /*
+        Exact relaxation of the 4 lengths k..k+3, vectorized. Bit-identical to the
+        scalar tail loop of UpdateCostsForRun: each lane computes
+        (costLen[k] + costDist) + costsj in double, compares against the float cost
+        widened to double, and rounds to float on store.
+        */
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static void Relax4(ref float costs, ref ushort lengths, ref double costLen, int k,
+                           Vector256<double> vDist, Vector256<double> vCostj,
+                           Vector256<double> vMin)
+        {
+            ref float cp = ref Unsafe.Add(ref costs, k);
+            Vector128<float> curf = Vector128.LoadUnsafe(ref cp);
+            Vector256<double> cur = Avx.ConvertToVector256Double(curf);
+            Vector256<double> newCost = Avx.Add(
+                Avx.Add(Vector256.LoadUnsafe(ref costLen, (nuint)k), vDist), vCostj);
+            /* Same early-out as the scalar loop (cur <= mincostaddcostj skips). */
+            Vector256<double> take = Avx.And(Avx.CompareLessThan(newCost, cur),
+                                             Avx.CompareGreaterThan(cur, vMin));
+            int bits = Avx.MoveMask(take);
+            if (bits == 0) return;
+
+            /* Narrow the 64-bit lane mask to 32-bit lanes (each lane is all-ones or
+               zero, so either half will do) and blend the rounded costs in. */
+            Vector128<float> take32 = Sse.Shuffle(take.GetLower().AsSingle(),
+                                                  take.GetUpper().AsSingle(), 0b10_00_10_00);
+            Vector128<float> newf = Avx.ConvertToVector128Single(newCost);
+            Sse41.BlendVariable(curf, newf, take32).StoreUnsafe(ref cp);
+            do
+            {
+                int b = BitOperations.TrailingZeroCount(bits);
+                Unsafe.Add(ref lengths, k + b) = (ushort)(k + b);
+                bits &= bits - 1;
+            } while (bits != 0);
         }
 
         /*
@@ -381,22 +482,11 @@ namespace ZopfliCSharp
         static void FollowPath(ZopfliBlockState s,
                        byte[] InFile, int instart, int inend,
                        List<ushort> path, ulong pathsize,
-                       ZopfliLZ77Store store, ZopfliHash h)
+                       ZopfliLZ77Store store, ZopfliHashChains chains)
         {
-            int i, j, pos;
-            int windowstart = instart > ZopfliHash.ZOPFLI_WINDOW_SIZE
-                ? instart - ZopfliHash.ZOPFLI_WINDOW_SIZE : 0;
-
-            ulong total_length_test = 0;
+            int i, pos;
 
             if (instart == inend) return;
-
-            h.ZopfliResetHash();
-            h.ZopfliWarmupHash(InFile, windowstart, inend);
-            for (i = windowstart; i < instart; i++)
-            {
-                h.ZopfliUpdateHash(InFile, i, inend);
-            }
 
             pos = instart;
             for (i = 0; i < (int)pathsize; i++)
@@ -406,34 +496,24 @@ namespace ZopfliCSharp
                 ushort dist = 0;
                 Debug.Assert(pos < inend);
 
-                h.ZopfliUpdateHash(InFile, pos, inend);
-
                 /* Add to output. */
                 if (length >= ZOPFLI_MIN_MATCH)
                 {
                     /* Get the distance by recalculating longest match. The found length
                     should match the length from the path. */
-                    ZopfliFindLongestMatch(s, h, InFile, pos, inend, length, null,
+                    ZopfliFindLongestMatch(s, chains, InFile, pos, inend, length, null,
                                             ref dist,  ref dummy_length);
                     Debug.Assert(!(dummy_length != length && length > 2 && dummy_length > 2));
                     ZopfliVerifyLenDist(InFile, inend, pos, dist, length);
                     ZopfliStoreLitLenDist(length, dist, pos, store);
-                    total_length_test += length;
                 }
                 else
                 {
                     length = 1;
                     ZopfliStoreLitLenDist(InFile[pos], 0, pos, store);
-                    total_length_test++;
                 }
-
 
                 Debug.Assert(pos + length <= inend);
-                for (j = 1; j < length; j++)
-                {
-                    h.ZopfliUpdateHash(InFile, pos + j, inend);
-                }
-
                 pos += length;
             }
         }
@@ -482,13 +562,13 @@ namespace ZopfliCSharp
         static double LZ77OptimalRun(ZopfliBlockState s,
             byte[] InFile, int instart, int inend, List<ushort> path,
             ushort[] length_array, SymbolStats stats, ZopfliLZ77Store store,
-            ZopfliHash h, float[] costs, bool fixedcosts)
+            ZopfliHashChains chains, float[] costs, bool fixedcosts)
         {
-            double cost = GetBestLengths(s, InFile, instart, inend, stats, length_array, h, costs, fixedcosts);
+            double cost = GetBestLengths(s, InFile, instart, inend, stats, length_array, chains, costs, fixedcosts);
             ulong pathsize = 0;
             path.Clear();
             TraceBackwards((ulong)(inend - instart), length_array, path, ref pathsize);
-            FollowPath(s, InFile, instart, inend, path, pathsize, store, h);
+            FollowPath(s, InFile, instart, inend, path, pathsize, store, chains);
             Debug.Assert(cost < ZOPFLI_LARGE_FLOAT);
             return cost;
         }
@@ -503,7 +583,8 @@ namespace ZopfliCSharp
             ushort[] length_array = new ushort[blocksize + 1];
             List<ushort> path = new List<ushort>();
             ZopfliLZ77Store currentstore = new ZopfliLZ77Store(InFile);
-            ZopfliHash h = new ZopfliHash();
+            /* Every pass over this block sees the same hash chains; build them once. */
+            ZopfliHashChains chains = new ZopfliHashChains(InFile, instart, inend);
             SymbolStats stats = new SymbolStats();
             SymbolStats beststats = new SymbolStats();
             SymbolStats laststats = new SymbolStats();
@@ -520,7 +601,7 @@ namespace ZopfliCSharp
             the statistics of the previous run. */
 
             /* Initial run. */
-            ZopfliLZ77Greedy(s, InFile, instart, inend, currentstore, h);
+            ZopfliLZ77Greedy(s, InFile, instart, inend, currentstore, chains);
             GetStatistics(currentstore, stats);
 
             /* Repeat statistics with each time the cost model from the previous stat
@@ -529,7 +610,7 @@ namespace ZopfliCSharp
             {
                 currentstore.ResetStore(InFile);
                 LZ77OptimalRun(s, InFile, instart, inend, path, length_array, stats,
-                               currentstore, h, costs, false);
+                               currentstore, chains, costs, false);
                 cost = ZopfliCalculateBlockSize(currentstore, 0, currentstore.size, 2);
                 if (Globals.verbose_more > 0 || (Globals.verbose > 0 && cost < bestcost))
                 {
@@ -575,7 +656,7 @@ namespace ZopfliCSharp
             ushort[] length_array = new ushort[blocksize + 1];
             List<ushort> path = new List<ushort>();
             path.Add(0);
-            ZopfliHash h = new ZopfliHash();
+            ZopfliHashChains chains = new ZopfliHashChains(InFile, (int)instart, (int)inend);
             float[] costs = new float[blocksize + 1];
             SymbolStats stats = new SymbolStats();
 
@@ -585,7 +666,7 @@ namespace ZopfliCSharp
             /* Shortest path for fixed tree This one should give the shortest possible
             result for fixed tree, no repeated runs are needed since the tree is known. */
             LZ77OptimalRun(s, InFile, (int)instart, (int)inend, path,
-                           length_array, stats, store, h, costs, true);
+                           length_array, stats, store, chains, costs, true);
 
 
         }

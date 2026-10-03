@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using zopfli_csharp;
 
 namespace ZopfliCSharp
@@ -22,7 +23,7 @@ namespace ZopfliCSharp
         const int ZOPFLI_MASTER_BLOCK_SIZE = 1000000;
 
         /* Minimum and maximum length that can be encoded in deflate. */
-        const int ZOPFLI_MAX_MATCH = 258;
+        public const int ZOPFLI_MAX_MATCH = 258;
         const int ZOPFLI_MIN_MATCH = 3;
 
         /* Number of distinct literal/length and distance symbols in DEFLATE */
@@ -326,62 +327,97 @@ namespace ZopfliCSharp
         }
 
         /*
-        Gets distance, length and sublen values from the cache if possible.
-        Returns 1 if it got the values from the cache, 0 if not.
+        The length of the match between pos and the candidate at pos - dist (capped at
+        limit), or 0 if it cannot be longer than best. Part of the chain walk in
+        ZopfliFindLongestMatch; see there for why the unchecked reads are in range.
+        */
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static int MatchLength(ref byte data, byte[] array, int pos, int dist, int best,
+                               int avail, int same0, ref ushort csame, int cpos, int limit,
+                               int arrayend)
+        {
+            Debug.Assert(dist > 0 && dist <= pos && cpos - dist >= 0);
+            int scan = pos;
+            int match = pos - dist;
+
+            /* Testing the byte at position bestlength first, goes slightly faster. */
+            if (best < avail
+                && Unsafe.Add(ref data, scan + best) != Unsafe.Add(ref data, match + best))
+            {
+                return 0;
+            }
+            if (same0 > 2 && Unsafe.Add(ref data, scan) == Unsafe.Add(ref data, match))
+            {
+                int same1 = Unsafe.Add(ref csame, cpos - dist);
+                int same = same0 < same1 ? same0 : same1;
+                if (same > limit) same = limit;
+                scan += same;
+                match += same;
+            }
+            return GetMatch(scan, match, arrayend, array) - pos;  /* The found length. */
+        }
+
+        /*
+        Gets distance, length and runs values from the cache if possible.
+        Returns whether it got the values from the cache. runs, if given, must be
+        empty (count 0) on entry.
         Updates the limit value to a smaller one if possible with more limited
         information from the cache.
         */
-        static int TryGetFromLongestMatchCache(ZopfliBlockState s,
-            ulong pos, ref int limit,
-            ushort[] sublen, ref ushort distance, ref ushort length)
+        static bool TryGetFromLongestMatchCache(ZopfliBlockState s,
+            int pos, ref int limit,
+            MatchRuns runs, ref ushort distance, ref ushort length)
         {
-            /* Hoist the cache arrays and read each element once; use an int index so the
-               array accesses get bounds-check elimination (ulong indices defeat it). */
+            /* Hoist the cache arrays and read each element once. */
             ushort[] lmcLength = s.lmc.length;
-            if (lmcLength == null) return 0;  /* No cache (add_lmc == 0). */
+            if (lmcLength == null) return false;  /* No cache (add_lmc == 0). */
 
-            int lmcpos = (int)(pos - (ulong)s.blockstart);
+            int lmcpos = pos - s.blockstart;
             ushort cachedLen = lmcLength[lmcpos];
 
             /* Length > 0 and dist 0 is invalid combination, which indicates on purpose
                that this cache value is not filled in yet. */
             bool cache_available = cachedLen == 0 || s.lmc.dist[lmcpos] != 0;
-            if (!cache_available) return 0;
+            if (!cache_available) return false;
 
-            /* Pure, so computing it once (when needed) matches the original call count. */
-            uint maxCached = sublen != null ? s.ZopfliMaxCachedSublen((ulong)lmcpos) : 0;
+            int maxCached = runs != null ? s.ZopfliMaxCachedLength(lmcpos) : 0;
 
             bool limit_ok_for_cache =
                 limit == ZOPFLI_MAX_MATCH || cachedLen <= limit ||
-                (sublen != null && maxCached >= limit);
-            if (!limit_ok_for_cache) return 0;
+                (runs != null && maxCached >= limit);
+            if (!limit_ok_for_cache) return false;
 
-            if (sublen == null || cachedLen <= maxCached)
+            if (runs == null || cachedLen <= maxCached)
             {
                 length = cachedLen;
                 if (length > limit) length = (ushort)limit;
-                if (sublen != null)
+                if (runs != null)
                 {
-                    s.ZopfliCacheToSublen((ulong)lmcpos, length, sublen);
-                    distance = sublen[length];
-                    if (limit == ZOPFLI_MAX_MATCH && length >= ZOPFLI_MIN_MATCH)
+                    /* The distance is that of the run holding length. Below
+                       ZOPFLI_MIN_MATCH there is no match and callers ignore it. */
+                    distance = 0;
+                    if (length >= ZOPFLI_MIN_MATCH)
                     {
-                        Debug.Assert(sublen[length] == s.lmc.dist[lmcpos]);
+                        s.ZopfliCacheToRuns(lmcpos, runs);
+                        int r = 0;
+                        while (runs.end[r] < length) r++;
+                        distance = runs.dist[r];
+                        Debug.Assert(limit != ZOPFLI_MAX_MATCH || distance == s.lmc.dist[lmcpos]);
                     }
                 }
                 else
                 {
                     distance = s.lmc.dist[lmcpos];
                 }
-                return 1;
+                return true;
             }
-            /* Can't use much of the cache, since the "sublens" need to be calculated,
+            /* Can't use much of the cache, since the runs need to be calculated,
                but at least we already know when to stop. */
             limit = cachedLen;
-            return 0;
+            return false;
         }
 
-        static void StoreInLongestMatchCache(ZopfliBlockState s, int pos, int limit, ushort[] sublen, ushort distance, ushort length)
+        static void StoreInLongestMatchCache(ZopfliBlockState s, int pos, int limit, MatchRuns runs, ushort distance, ushort length)
         {
             /* The LMC cache starts at the beginning of the block rather than the
              beginning of the whole array. */
@@ -392,33 +428,38 @@ namespace ZopfliCSharp
             bool cache_available = (s.lmc.length != null &&(s.lmc.length[lmcpos] == 0 ||
                 s.lmc.dist[lmcpos] != 0));
 
-            if (s.lmc.length != null && sublen != null && limit == ZOPFLI_MAX_MATCH && sublen.Length > 0 && !cache_available)
+            if (s.lmc.length != null && runs != null && limit == ZOPFLI_MAX_MATCH && !cache_available)
             {
                 Debug.Assert(s.lmc.length[lmcpos] == 1 && s.lmc.dist[lmcpos] == 0);
                 s.lmc.dist[lmcpos] = (ushort)(length < ZOPFLI_MIN_MATCH ? 0 : distance);
                 s.lmc.length[lmcpos] = (ushort)(length < ZOPFLI_MIN_MATCH ? 0 : length);
                 Debug.Assert(!(s.lmc.length[lmcpos] == 1 && s.lmc.dist[lmcpos] == 0));
-                s.ZopfliSublenToCache(sublen, lmcpos, length);
+                s.ZopfliRunsToCache(runs, lmcpos, length);
             }
         }
 
-        static void ZopfliFindLongestMatch(ZopfliBlockState s, ZopfliHash h, byte[] array, int pos, int size, int limit, ushort[] sublen,
+        /*
+        Finds the longest match (length and corresponding distance) for LZ77
+        compression, walking the hash chains precomputed in c.
+        Even when not using the runs, it can be more efficient to provide them,
+        because only then the caching is used.
+        array: the data
+        pos: position in the data to find the match for
+        size: size of the data
+        limit: limit length to maximum this value (default should be 258). This allows
+            finding a shorter dist for that length (= less extra bits). Must be
+            in the range [ZOPFLI_MIN_MATCH, ZOPFLI_MAX_MATCH].
+        runs: output, or null. Receives, for each length from ZOPFLI_MIN_MATCH up to
+            the found length, the smallest distance required to reach this length, in
+            run-length form (see MatchRuns).
+        */
+        static void ZopfliFindLongestMatch(ZopfliBlockState s, ZopfliHashChains c, byte[] array, int pos, int size, int limit, MatchRuns runs,
                           ref ushort distance, ref ushort length)
         {
-            ushort hpos = (ushort)(pos & ZopfliHash.ZOPFLI_WINDOW_MASK), p, pp;
-            ushort bestdist = 0;
-            ushort bestlength = 1;
-            int scan;
-            int match;
-            
             int chain_counter = ZOPFLI_MAX_CHAIN_HITS;  /* For quitting early. */
 
-            int[] hhead = h.head;
-            short[] hprev = h.prev;
-            short[] hhashval = h.hashval;
-            int hval = h.val;
-
-            if (TryGetFromLongestMatchCache(s, (ulong)pos, ref limit, sublen, ref distance, ref length) > 0) {
+            if (runs != null) runs.count = 0;
+            if (TryGetFromLongestMatchCache(s, pos, ref limit, runs, ref distance, ref length)) {
                 Debug.Assert(pos + length <= size);
                 return;
             }
@@ -443,93 +484,98 @@ namespace ZopfliCSharp
 
             int arrayend = pos + limit;
 
-            Debug.Assert(hval < 65536);
+            /* Index of pos in the chain arrays; the candidate at distance dist is at
+               cpos - dist. */
+            int cpos = pos - c.start;
 
-            pp = (ushort)hhead[hval];  /* During the whole loop, p == hprev[pp]. */
-            p = (ushort)hprev[pp];
+            /* These loops run for every chain step (hundreds of millions), so they read
+               through unchecked refs and keep their state in int locals, which lets the
+               JIT keep the hot path in registers. Every access is in range: candidates
+               are at 0 <= pos - dist < pos (and chain entries at cpos - dist >= 0, as
+               chains only link positions from c.start on), and data at pos + best is
+               only read when that is below size <= array.Length (see MatchLength). */
+            Debug.Assert(cpos >= 0 && cpos < c.step.Length && size <= array.Length);
+            ref byte data = ref MemoryMarshal.GetArrayDataReference(array);
+            ref ushort csame = ref MemoryMarshal.GetArrayDataReference(c.same);
+            ref ushort step = ref MemoryMarshal.GetArrayDataReference(c.step);
+            ref ushort cval2 = ref MemoryMarshal.GetArrayDataReference(c.val2);
+            int same0 = Unsafe.Add(ref csame, cpos);
+            int avail = size - pos;
+            int best = 1;
+            int bestd = 0;
+            int currentlength;
 
-            Debug.Assert(pp == hpos);
+            int dist = Unsafe.Add(ref step, cpos);
+            if (dist == 0) dist = ZopfliHash.ZOPFLI_WINDOW_SIZE;
 
-            ushort dist = (ushort)(p < pp ? pp - p : ZopfliHash.ZOPFLI_WINDOW_SIZE - p + pp);
-
-            /* Go through all distances. */
+            /* Phase 1: the first hash, until the switch condition holds; phase 2 then
+               follows the second hash for the rest. Separate loops, so neither has to
+               track which chain it is on. */
+            int val2 = Unsafe.Add(ref cval2, cpos);
             while (dist < ZopfliHash.ZOPFLI_WINDOW_SIZE)
             {
-                ushort currentlength = 0;
-
-                Debug.Assert(p < ZopfliHash.ZOPFLI_WINDOW_SIZE);
-                Debug.Assert(p == hprev[pp]);
-                Debug.Assert(hhashval[p] == hval);
-
-                if (dist > 0)
+                currentlength = MatchLength(ref data, array, pos, dist, best, avail, same0,
+                                            ref csame, cpos, limit, arrayend);
+                if (currentlength > best)
                 {
-                    Debug.Assert(pos < size);
-                    Debug.Assert(dist <= pos);
-                    scan = pos;
-                    match = pos - dist;
-
-                    /* Testing the byte at position bestlength first, goes slightly faster. */
-                    if (pos + bestlength >= size
-                        || array[scan + bestlength] == array[match + bestlength])
+                    /* Lengths best + 1 .. currentlength are first reached at this
+                       distance: a new run (lengths below ZOPFLI_MIN_MATCH don't count). */
+                    if (runs != null && currentlength >= ZOPFLI_MIN_MATCH)
                     {
-
-                        ushort same0 = h.same[hpos];
-                        if (same0 > 2 && array[scan] == array[match])
-                        {
-                            ushort same1 = h.same[(pos - dist) & ZopfliHash.ZOPFLI_WINDOW_MASK];
-                            ushort same = same0 < same1 ? same0 : same1;
-                            if (same > limit) same = (ushort)limit;
-                            scan += same;
-                            match += same;
-                        }
-                        scan = GetMatch(scan, match, arrayend, array);
-                        currentlength = (ushort)(scan - pos);  /* The found length. */
+                        runs.end[runs.count] = currentlength;
+                        runs.dist[runs.count++] = (ushort)dist;
                     }
-
-                    if (currentlength > bestlength)
-                    {
-                        if (sublen != null && sublen.Length > 0)
-                        {
-                            ushort j;
-                            for (j = (ushort)(bestlength + 1); j <= currentlength; j++)
-                            {
-                                sublen[j] = dist;
-                            }
-                        }
-                        bestdist = dist;
-                        bestlength = currentlength;
-                        if (currentlength >= limit) break;
-                    }
+                    bestd = dist;
+                    best = currentlength;
+                    if (currentlength >= limit) goto done;
                 }
 
+                /* Switch to the other hash once this will be more efficient: now use
+                   the hash that encodes the length and first byte. */
+                if (best >= same0 && val2 == Unsafe.Add(ref cval2, cpos - dist)) goto hash2;
 
-                /* Switch to the other hash once this will be more efficient. */
-                if (hhead != h.head2 && bestlength >= h.same[hpos] &&
-                    h.val2 == h.hashval2[p])
-                {
-                    /* Now use the hash that encodes the length and first byte. */
-                    hhead = h.head2;
-                    hprev = h.prev2;
-                    hhashval = h.hashval2;
-                    hval = h.val2;
-                }
+                int next = Unsafe.Add(ref step, cpos - dist);
+                if (next == 0) goto done;  /* End of chain. */
+                dist += next;
 
-                pp = p;
-                p = (ushort)hprev[p];
-                if (p == pp) break;  /* Uninited prev value. */
+                chain_counter--;
+                if (chain_counter <= 0) goto done;
+            }
+            goto done;
 
-                dist += p < pp ? (ushort)(pp - p) : (ushort)((ZopfliHash.ZOPFLI_WINDOW_SIZE - p) + pp);
+        hash2:
+            /* Phase 2: the second hash, continuing from the current candidate. */
+            step = ref MemoryMarshal.GetArrayDataReference(c.step2);
+            while (true)
+            {
+                int next = Unsafe.Add(ref step, cpos - dist);
+                if (next == 0) break;  /* End of chain. */
+                dist += next;
 
                 chain_counter--;
                 if (chain_counter <= 0) break;
+
+                if (dist >= ZopfliHash.ZOPFLI_WINDOW_SIZE) break;
+                currentlength = MatchLength(ref data, array, pos, dist, best, avail, same0,
+                                            ref csame, cpos, limit, arrayend);
+                if (currentlength > best)
+                {
+                    if (runs != null && currentlength >= ZOPFLI_MIN_MATCH)
+                    {
+                        runs.end[runs.count] = currentlength;
+                        runs.dist[runs.count++] = (ushort)dist;
+                    }
+                    bestd = dist;
+                    best = currentlength;
+                    if (currentlength >= limit) break;
+                }
             }
 
-            StoreInLongestMatchCache(s, pos, limit, sublen, bestdist, bestlength);
-
-            Debug.Assert(bestlength <= limit);
-
-            distance = bestdist;
-            length = bestlength;
+        done:
+            Debug.Assert(best <= limit);
+            distance = (ushort)bestd;
+            length = (ushort)best;
+            StoreInLongestMatchCache(s, pos, limit, runs, distance, length);
             Debug.Assert(pos + length <= size);
         }
 
@@ -642,15 +688,13 @@ namespace ZopfliCSharp
 
         }
 
-        static void ZopfliLZ77Greedy(ZopfliBlockState s, byte[] InFile, int instart, int inend, ZopfliLZ77Store store, ZopfliHash h)
+        static void ZopfliLZ77Greedy(ZopfliBlockState s, byte[] InFile, int instart, int inend, ZopfliLZ77Store store, ZopfliHashChains chains)
         {
-            int i, j;
+            int i;
             ushort leng = 0;
             ushort dist = 0;
             int lengthscore;
-            int windowstart = instart > ZopfliHash.ZOPFLI_WINDOW_SIZE
-                ? instart - ZopfliHash.ZOPFLI_WINDOW_SIZE : 0;
-            ushort[] dummysublen = new ushort[259];
+            MatchRuns dummyruns = new MatchRuns();  /* Only so the cache gets filled. */
 
             /* Lazy matching. */
             uint prev_length = 0;
@@ -660,17 +704,9 @@ namespace ZopfliCSharp
 
             if (instart == inend) return;
 
-            h.ZopfliResetHash();
-            h.ZopfliWarmupHash(InFile, windowstart, inend);
-            for (i = windowstart; i < instart; i++)
-            {
-                h.ZopfliUpdateHash(InFile, i, inend);
-            }
-
             for (i = instart; i < inend; i++)
             {
-                h.ZopfliUpdateHash(InFile, i, inend);
-                ZopfliFindLongestMatch(s, h, InFile, i, inend, ZOPFLI_MAX_MATCH, dummysublen,
+                ZopfliFindLongestMatch(s, chains, InFile, i, inend, ZOPFLI_MAX_MATCH, dummyruns,
                            ref dist, ref leng);
                 lengthscore = GetLengthScore(leng, dist);
                 /* Lazy matching. */
@@ -698,12 +734,8 @@ namespace ZopfliCSharp
                         /* Add to output. */
                         ZopfliVerifyLenDist(InFile, inend, i - 1, dist, leng);
                         ZopfliStoreLitLenDist(leng, dist, i - 1, store);
-                        for (j = 2; j < leng; j++)
-                        {
-                            Debug.Assert(i < inend);
-                            i++;
-                            h.ZopfliUpdateHash(InFile, i, inend);
-                        }
+                        Debug.Assert(i + leng - 2 < inend);
+                        i += leng - 2;
                         continue;
                     }
                 }
@@ -727,12 +759,8 @@ namespace ZopfliCSharp
                     leng = 1;
                     ZopfliStoreLitLenDist(InFile[i], 0, i, store);
                 }
-                for (j = 1; j < leng; j++)
-                {
-                    Debug.Assert(i < inend);
-                    i++;
-                    h.ZopfliUpdateHash(InFile, i, inend);
-                }
+                Debug.Assert(i + leng - 1 < inend);
+                i += leng - 1;
             }
         }
 
@@ -1080,9 +1108,24 @@ namespace ZopfliCSharp
             d_counts.CopyTo(d_counts2, 0);
             OptimizeHuffmanForRle(ZOPFLI_NUM_LL, ll_counts2);
             OptimizeHuffmanForRle(ZOPFLI_NUM_D, d_counts2);
-            ZopfliCalculateBitLengths(ll_counts2, ZOPFLI_NUM_LL, 15, ll_lengths2);
-            ZopfliCalculateBitLengths(d_counts2, ZOPFLI_NUM_D, 15, d_lengths2);
-            PatchDistanceCodesForBuggyDecoders(d_lengths2);
+
+            /* The lengths are a pure function of the counts (ll_lengths and d_lengths
+               were computed, and d_lengths patched, exactly like the ones below), so
+               for counts the RLE optimization left unchanged, reuse them. If neither
+               changed, the alternative costs exactly the same, and the strict
+               comparison below would keep the original anyway. */
+            bool llSame = ll_counts2.AsSpan().SequenceEqual(ll_counts);
+            bool dSame = d_counts2.AsSpan().SequenceEqual(d_counts);
+            if (llSame && dSame) return treesize + datasize;
+
+            if (llSame) ll_lengths.CopyTo(ll_lengths2, 0);
+            else ZopfliCalculateBitLengths(ll_counts2, ZOPFLI_NUM_LL, 15, ll_lengths2);
+            if (dSame) d_lengths.CopyTo(d_lengths2, 0);
+            else
+            {
+                ZopfliCalculateBitLengths(d_counts2, ZOPFLI_NUM_D, 15, d_lengths2);
+                PatchDistanceCodesForBuggyDecoders(d_lengths2);
+            }
 
             treesize2 = CalculateTreeSize(ll_lengths2, d_lengths2);
             datasize2 = CalculateBlockSymbolSizeGivenCounts(ll_counts, d_counts,
@@ -1982,11 +2025,11 @@ namespace ZopfliCSharp
             List<ulong> lz77splitpoints = new List<ulong>();
             ulong nlz77points;
             ZopfliLZ77Store store = new ZopfliLZ77Store(InFile);
-            ZopfliHash h = new ZopfliHash();
+            ZopfliHashChains chains = new ZopfliHashChains(InFile, instart, inend);
 
             /* Unintuitively, Using a simple LZ77 method here instead of ZopfliLZ77Optimal
             results in better blocks. */
-            ZopfliLZ77Greedy(s, InFile, instart, inend, store, h);
+            ZopfliLZ77Greedy(s, InFile, instart, inend, store, chains);
 
             ZopfliBlockSplitLZ77(store, lz77splitpoints, out nlz77points );
 

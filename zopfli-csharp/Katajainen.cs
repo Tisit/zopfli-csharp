@@ -10,20 +10,34 @@ namespace zopfli_csharp
         const int CHAR_BIT = 8;
 
         /*
-        Nodes forming chains. Also used to represent leaves.
+        Nodes forming chains, stored as parallel arrays (structure of arrays) and
+        referenced by index, with -1 as the null chain. Compared to a pool of Node
+        objects this avoids pointer chasing and the covariant type check on every
+        reference store into a Node[].
+        weight: total weight (symbol count) of this chain.
+        tail: previous node(s) of this chain, or -1 if none.
+        count: number of leaves before this chain.
+        The pool persists across calls and only grows, so a node can still hold data
+        from an earlier call when it is handed out; the result does not depend on it
+        (the C original uses uninitialized malloc memory here).
         */
-        class Node
-        {
-            public uint weight;  /* Total weight (symbol count) of this chain. */
-            public Node tail;  /* Previous node(s) of this chain, or 0 if none. */
-            public int count;  /* Leaf symbol index, or number of leaves before this chain. */
-        };
+        static uint[] _weight = Array.Empty<uint>();
+        static int[] _tail = Array.Empty<int>();
+        static int[] _count = Array.Empty<int>();
 
-        static void InitNode(uint weight, int count, Node tail, Node node)
+        static void EnsurePool(int length)
         {
-            node.weight = weight;
-            node.count = count;
-            node.tail = tail;
+            if (_weight.Length >= length) return;
+            Array.Resize(ref _weight, length);
+            Array.Resize(ref _tail, length);
+            Array.Resize(ref _count, length);
+        }
+
+        static void InitNode(uint weight, int count, int tail, int node)
+        {
+            _weight[node] = weight;
+            _count[node] = count;
+            _tail[node] = tail;
         }
 
         /*
@@ -31,29 +45,20 @@ namespace zopfli_csharp
         new chain is, depending on the weights, a leaf or a combination of two chains
         from the previous list.
         lists: The lists of chains.
-        maxbits: Number of lists.
-        leaves: The leaves, one per symbol.
+        leafWeights: The weights of the leaves, one per symbol, lightest first.
         numsymbols: Number of leaves.
-        pool: the node memory pool.
+        PoolNext: the next free node of the node memory pool.
         index: The index of the list in which a new chain or leaf is required.
         */
-        /* `lists` is a flattened [maxbits, 2] array: element [i, j] lives at [i * 2 + j].
-           A flat Node[] is used instead of Node[,] because multidimensional-array element
-           access goes through an out-of-line CLR helper (IL_STUB_Array_Set/_Get), while
-           1-D access is inlined. */
-        static void BoundaryPM(Node[] lists, Node[] leaves, int numsymbols,
-                               Span<Node> pool, ref int PoolNext, int index)
+        /* `lists` is a flattened [maxbits, 2] array of node indices: element [i, j]
+           lives at [i * 2 + j]. */
+        static void BoundaryPM(int[] lists, uint[] leafWeights, int numsymbols,
+                               ref int PoolNext, int index)
         {
-            Node newchain;
-            Node oldchain;
-            int lastcount = lists[index * 2 + 1].count;  /* Count of last chain of list. */
+            int oldchain = lists[index * 2 + 1];
+            int lastcount = _count[oldchain];  /* Count of last chain of list. */
+            int newchain = PoolNext++;
 
-
-            newchain = pool[PoolNext++];
-            oldchain = lists[index * 2 + 1];
-
-            /* These are set up before the recursive calls below, so that there is a list
-            pointing to the new node, to let the garbage collection know it's in use. */
             lists[index * 2] = oldchain;
             lists[index * 2 + 1] = newchain;
 
@@ -61,47 +66,45 @@ namespace zopfli_csharp
             {
                 if (lastcount >= numsymbols) return;
                 /* New leaf node in list 0. */
-                InitNode(leaves[lastcount].weight, lastcount + 1, null, newchain);
+                InitNode(leafWeights[lastcount], lastcount + 1, -1, newchain);
             }
             else
             {
-                uint sum = lists[(index - 1) * 2].weight + lists[(index - 1) * 2 + 1].weight;
-                if (lastcount < numsymbols && sum > leaves[lastcount].weight)
+                uint sum = _weight[lists[(index - 1) * 2]] + _weight[lists[(index - 1) * 2 + 1]];
+                if (lastcount < numsymbols && sum > leafWeights[lastcount])
                 {
                     /* New leaf inserted in list, so count is incremented. */
-                    InitNode(leaves[lastcount].weight, lastcount + 1, oldchain.tail,
-                        newchain);
+                    InitNode(leafWeights[lastcount], lastcount + 1, _tail[oldchain], newchain);
                 }
                 else
                 {
                     InitNode(sum, lastcount, lists[(index - 1) * 2 + 1], newchain);
                     /* Two lookahead chains of previous list used up, create new ones. */
-                    BoundaryPM(lists, leaves, numsymbols, pool, ref PoolNext, index - 1);
-                    BoundaryPM(lists, leaves, numsymbols, pool, ref PoolNext, index - 1);
+                    BoundaryPM(lists, leafWeights, numsymbols, ref PoolNext, index - 1);
+                    BoundaryPM(lists, leafWeights, numsymbols, ref PoolNext, index - 1);
                 }
             }
-
         }
 
-        static void BoundaryPMFinal(Node[] lists, Node[] leaves, int numsymbols,
-                               Span<Node> pool, ref int PoolNext, int index)
+        static void BoundaryPMFinal(int[] lists, uint[] leafWeights, int numsymbols,
+                               ref int PoolNext, int index)
         {
-            int lastcount = lists[index * 2 + 1].count;  /* Count of last chain of list. */
+            int lastcount = _count[lists[index * 2 + 1]];  /* Count of last chain of list. */
 
-            ulong sum = lists[(index - 1) * 2].weight + lists[(index - 1) * 2 + 1].weight;
+            ulong sum = _weight[lists[(index - 1) * 2]] + _weight[lists[(index - 1) * 2 + 1]];
 
-            if (lastcount < numsymbols && sum > leaves[lastcount].weight)
+            if (lastcount < numsymbols && sum > leafWeights[lastcount])
             {
-                Node newchain = pool[PoolNext];
-                Node oldchain = lists[index * 2 + 1].tail;
+                int newchain = PoolNext;
+                int oldchain = _tail[lists[index * 2 + 1]];
 
                 lists[index * 2 + 1] = newchain;
-                newchain.count = lastcount + 1;
-                newchain.tail = oldchain;
+                _count[newchain] = lastcount + 1;
+                _tail[newchain] = oldchain;
             }
             else
             {
-                lists[index * 2 + 1].tail = lists[(index - 1) * 2 + 1];
+                _tail[lists[index * 2 + 1]] = lists[(index - 1) * 2 + 1];
             }
         }
 
@@ -109,14 +112,13 @@ namespace zopfli_csharp
         Initializes each list with as lookahead chains the two leaves with lowest
         weights.
         */
-        static void InitLists(
-            Span<Node> pool, ref int PoolNext, Node[] leaves, int maxbits, Node[] lists)
+        static void InitLists(ref int PoolNext, uint[] leafWeights, int maxbits, int[] lists)
         {
             int i;
-            Node node0 = pool[PoolNext++];
-            Node node1 = pool[PoolNext++];
-            InitNode(leaves[0].weight, 1, null, node0);
-            InitNode(leaves[1].weight, 2, null, node1);
+            int node0 = PoolNext++;
+            int node1 = PoolNext++;
+            InitNode(leafWeights[0], 1, -1, node0);
+            InitNode(leafWeights[1], 2, -1, node1);
             for (i = 0; i < maxbits; i++)
             {
                 lists[i * 2] = node0;
@@ -128,20 +130,20 @@ namespace zopfli_csharp
         Converts result of boundary package-merge to the bitlengths. The result in the
         last chain of the last list contains the amount of active leaves in each list.
         chain: Chain to extract the bit length from (last chain from last list).
+        leafSymbols: The symbol each leaf represents, in leaf order.
         */
-        static void ExtractBitLengths(Node chain, Node[] leaves, uint[] bitlengths)
+        static void ExtractBitLengths(int chain, int[] leafSymbols, uint[] bitlengths)
         {
-            int[] counts = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+            Span<int> counts = stackalloc int[16];
 
-            uint end = 16;
-            uint ptr = 15;
+            int end = 16;
+            int ptr = 15;
             uint value = 1;
-            Node node;
             int val;
 
-            for (node = chain; node != null; node = node.tail)
+            for (int node = chain; node != -1; node = _tail[node])
             {
-                counts[--end] = node.count;
+                counts[--end] = _count[node];
             }
 
             val = counts[15];
@@ -149,63 +151,11 @@ namespace zopfli_csharp
             {
                 for (; val > counts[ptr - 1]; val--)
                 {
-                    bitlengths[leaves[val - 1].count] = value;
+                    bitlengths[leafSymbols[val - 1]] = value;
                 }
                 ptr--;
                 value++;
             }
-        }
-
-        static Node[] _nodes;
-
-        static Span<Node> InitializeNodes(int length)
-        {
-            if (_nodes is null || _nodes.Length < length)
-            {
-                Node[] temp_nodes;
-                temp_nodes = new Node[length];
-                for (int i = 0; i < length; i++)
-                {
-                    if(!(_nodes is null) && _nodes.Length > i)
-                    {
-                        temp_nodes[i] = _nodes[i];
-                    }
-                    else
-                    {
-                        temp_nodes[i] = new Node();
-                    }
-                 }
-
-                _nodes = temp_nodes;
-
-            }
-            return new Span<Node>(_nodes, 0, length);
-        }
-
-        static Node[] _leaves;
-
-        static Span<Node> InitializeLeaves(int length)
-        {
-            if (_leaves is null || _leaves.Length < length)
-            {
-                Node[] temp_nodes;
-                temp_nodes = new Node[length];
-                for (int i = 0; i < length; i++)
-                {
-                    if (!(_leaves is null) && _leaves.Length > i)
-                    {
-                        temp_nodes[i] = _leaves[i];
-                    }
-                    else
-                    {
-                        temp_nodes[i] = new Node();
-                    }
-                }
-
-                _leaves = temp_nodes;
-
-            }
-            return new Span<Node>(_leaves, 0, length);
         }
 
         public static int ZopfliLengthLimitedCodeLengths(
@@ -215,38 +165,21 @@ namespace zopfli_csharp
             int i;
             int numsymbols = 0;  /* Amount of symbols with frequency > 0. */
             int numBoundaryPMRuns;
-            Span<Node> nodes;
 
             /* Array of lists of chains. Each list requires only two lookahead chains at
-            a time, so each list is a array of two Node*'s. Flattened to a 1-D Node[] of
-            length maxbits*2 (element [i, j] at [i * 2 + j]) to avoid multidimensional
-            array access helpers. */
-            Node[] lists;
+            a time, so each list is a array of two node indices. Flattened to a 1-D int[]
+            of length maxbits*2 (element [i, j] at [i * 2 + j]). */
+            int[] lists;
 
             /* Initialize all bitlengths at 0. */
             bitlengths.Initialize();
 
-            /* Count used symbols and place them in the leaves. */
+            /* Count used symbols. */
             for (i = 0; i < n; i++)
             {
                 if (frequencies[i] > 0)
                 {
                     numsymbols++;
-                }
-            }
-
-            Node[] leaves = InitializeLeaves(numsymbols).ToArray();
-            int SymbolNumber = 0;
-
-            /* Count used symbols and place them in the leaves. */
-            for (i = 0; i < n; i++)
-            {
-
-                if (frequencies[i] > 0)
-                {
-                    leaves[SymbolNumber].weight = frequencies[i];
-                    leaves[SymbolNumber].count = i;  /* Index of symbol this leaf represents. */
-                    SymbolNumber++;
                 }
             }
 
@@ -259,15 +192,27 @@ namespace zopfli_csharp
             {
                 return 0;  /* No symbols at all. OK. */
             }
+
+            /* Place the used symbols in the leaves, in symbol order. */
+            int[] leafSymbols = new int[numsymbols];
+            int SymbolNumber = 0;
+            for (i = 0; i < n; i++)
+            {
+                if (frequencies[i] > 0)
+                {
+                    leafSymbols[SymbolNumber++] = i;
+                }
+            }
+
             if (numsymbols == 1)
             {
-                bitlengths[leaves[0].count] = 1;
+                bitlengths[leafSymbols[0]] = 1;
                 return 0;  /* Only one symbol, give it bitlength 1, not 0. OK. */
             }
             if (numsymbols == 2)
             {
-                bitlengths[leaves[0].count]++;
-                bitlengths[leaves[1].count]++;
+                bitlengths[leafSymbols[0]]++;
+                bitlengths[leafSymbols[1]]++;
                 return 0;
             }
 
@@ -275,20 +220,26 @@ namespace zopfli_csharp
             variable for stable sorting. */
             /* weight is a 32-bit uint and the low 9 bits are used to pack the count for
                stable sorting, so a weight must fit in the remaining 23 bits. (The C
-               original uses size_t weights and thus a 55-bit limit; here it is 23.) */
+               original uses size_t weights and thus a 55-bit limit; here it is 23.)
+               The packed keys are unique, so sorting them as plain integers yields
+               exactly the order of the original comparison sort. */
             const uint MAX_SORT_WEIGHT = 1u << (32 - 9);
+            uint[] keys = new uint[numsymbols];
             for (i = 0; i < numsymbols; i++)
             {
-                if (leaves[i].weight >= MAX_SORT_WEIGHT)
+                uint weight = frequencies[leafSymbols[i]];
+                if (weight >= MAX_SORT_WEIGHT)
                 {
                     return 1;  /* Error, we need 9 bits for the count. */
                 }
-                leaves[i].weight = (leaves[i].weight << 9) | (uint)leaves[i].count;
+                keys[i] = (weight << 9) | (uint)leafSymbols[i];
             }
-            Array.Sort(leaves, delegate (Node x, Node y) { return x.weight.CompareTo(y.weight); }) ;
+            Array.Sort(keys);
+            uint[] leafWeights = new uint[numsymbols];
             for (i = 0; i < numsymbols; i++)
             {
-                leaves[i].weight >>= 9;
+                leafWeights[i] = keys[i] >> 9;
+                leafSymbols[i] = (int)(keys[i] & 511);
             }
 
             if (numsymbols - 1 < maxbits)
@@ -297,21 +248,21 @@ namespace zopfli_csharp
             }
 
             /* Initialize node memory pool. */
-            nodes = InitializeNodes(maxbits * 2 * numsymbols);
+            EnsurePool(maxbits * 2 * numsymbols);
 
-            lists = new Node[maxbits * 2];
-            InitLists(nodes, ref PoolNext, leaves, maxbits, lists);
+            lists = new int[maxbits * 2];
+            InitLists(ref PoolNext, leafWeights, maxbits, lists);
 
             /* In the last list, 2 * numsymbols - 2 active chains need to be created. Two
             are already created in the initialization. Each BoundaryPM run creates one. */
             numBoundaryPMRuns = 2 * numsymbols - 4;
             for (i = 0; i < numBoundaryPMRuns - 1; i++)
             {
-                BoundaryPM(lists, leaves, numsymbols, nodes, ref PoolNext, maxbits - 1);
+                BoundaryPM(lists, leafWeights, numsymbols, ref PoolNext, maxbits - 1);
             }
-            BoundaryPMFinal(lists, leaves, numsymbols, nodes, ref PoolNext, maxbits - 1);
+            BoundaryPMFinal(lists, leafWeights, numsymbols, ref PoolNext, maxbits - 1);
 
-            ExtractBitLengths(lists[(maxbits - 1) * 2 + 1], leaves, bitlengths);
+            ExtractBitLengths(lists[(maxbits - 1) * 2 + 1], leafSymbols, bitlengths);
 
             return 0;  /* OK. */
 
